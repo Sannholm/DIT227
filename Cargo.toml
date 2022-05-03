@@ -10,3 +10,4 @@ glium = "0.31.0"
 glutin = "0.28.0"
 glam = "0.8.5"
 rand = "0.8.5"
+obj-rs = { version = "0.7.0", features = ["glium"] }
