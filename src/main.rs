@@ -65,13 +65,29 @@ const UPDATE_PARTICLES_SRC: &str = r#"
         vec4 velocities[];
     };
 
+    layout(std140) buffer ParticleRadiuses {
+        float radiuses[];
+    };
+
     layout(std140) buffer DebugOutput {
         vec4 debug[];
     };
 
     uniform sampler2D sceneDepth;
+    uniform sampler2D sceneNormal;
 
-    bool isColliding(vec3 pos) {
+    struct Collision {
+        vec3 pos;
+        vec3 normal;
+    };
+    const Collision DUMMY_COLLISION = Collision(vec3(0.0), vec3(0.0));
+
+    struct CollisionQuery {
+        bool colliding;
+        Collision collision;
+    };
+
+    CollisionQuery checkCollision(vec3 pos, float radius) {
         vec4 viewPos = worldToCameraMatrix * vec4(pos, 1.0);
         vec4 clipPos = cameraToClipMatrix * viewPos;
         vec2 ndcPos = clipPos.xy / clipPos.w;
@@ -84,28 +100,39 @@ const UPDATE_PARTICLES_SRC: &str = r#"
         float particleDepth = -viewPos.z;
         float geometryDepth = -geometryViewPos.z;
 
-        const float PARTICLE_RADIUS = 0.5;
-        return abs(particleDepth - geometryDepth) <= PARTICLE_RADIUS;
+        if (abs(particleDepth - geometryDepth) > radius) {
+            return CollisionQuery(false, DUMMY_COLLISION);
+        }
+
+        vec3 geometryNormal = normalize(texture(sceneNormal, ndcPos * 0.5 + 0.5).xyz);
+
+        Collision coll;
+        coll.pos = vec3(0); // TODO
+        coll.normal = geometryNormal;
+        return CollisionQuery(true, coll);
     }
 
     void main() {
         //positions[gl_GlobalInvocationID.x] = vec4(0.0, 0.0, 0.0, 1.0);
 
-        vec3 pos = positions[gl_GlobalInvocationID.x].xyz;
-        vec3 vel = velocities[gl_GlobalInvocationID.x].xyz;
+        vec3 p0 = positions[gl_GlobalInvocationID.x].xyz;
+        vec3 v0 = velocities[gl_GlobalInvocationID.x].xyz;
+        float radius = radiuses[gl_GlobalInvocationID.x];
         
-        // Apply impulses
-        vel += vec3(0.0, -9.82, 0.0) * deltaTime;
+        // Apply impluses // TODO: Before or after?
+        vec3 v1 = v0 + vec3(0.0, -9.82, 0.0) * deltaTime; // TODO: Euler integration?
+        vec3 p1 = p0 + v1 * deltaTime; // TODO: Euler integration?
 
-        if (isColliding(pos)) {
-            vel = vec3(0.0, 10.0, 0.0);
+        CollisionQuery query = checkCollision(p1, radius);
+        if (query.colliding) {
+            // Collision response
+            p1 = p0; // TODO: More accurately find intersection point
+            const float RESTITUTION = 0.9;
+            v1 = reflect(v1, query.collision.normal) * RESTITUTION;
         }
 
-        // Move by current velocity
-        pos += vel * deltaTime; // TODO: Euler integration?
-
-        positions[gl_GlobalInvocationID.x] = vec4(pos, 1.0);
-        velocities[gl_GlobalInvocationID.x] = vec4(vel, 1.0);
+        positions[gl_GlobalInvocationID.x] = vec4(p1, 1.0);
+        velocities[gl_GlobalInvocationID.x] = vec4(v1, 1.0);
     }
 "#;
 
@@ -129,10 +156,16 @@ const VERTEX_SHADER_SRC: &str = r#"
         vec4 positions[];
     };
 
+    layout(std140) buffer ParticleRadiuses {
+        float radiuses[];
+    };
+
     out vec2 uv;
 
     void main() {
         vec3 particlePos = positions[gl_InstanceID].xyz;
+        float particleRadius = radiuses[gl_InstanceID];
+
         vec3 normal = normalize(cameraPos - particlePos); // Viewpoint-facing
         //normal = normalize(inverse(mat3(worldToCameraMatrix)) * vec3(0, 0, 1)); // Viewplane-facing
         
@@ -142,7 +175,7 @@ const VERTEX_SHADER_SRC: &str = r#"
         mat3 billboardMatrix = mat3(rightBasis, upBasis, normal);
 
         vec2 offset = OFFSETS[gl_VertexID];
-        vec3 vertexPos = particlePos + billboardMatrix * vec3(offset, 0);
+        vec3 vertexPos = particlePos + billboardMatrix * vec3(offset * particleRadius, 0);
 
         uv = offset + vec2(0.5);
         gl_Position = cameraToClipMatrix * worldToCameraMatrix * vec4(vertexPos, 1);
@@ -178,7 +211,7 @@ const MESH_VERTEX_SHADER_SRC: &str = r#"
     out vec2 uv;
 
     void main() {
-        n = normal;
+        n = (modelToWorldMatrix * vec4(normal, 0.0)).xyz; // TODO: Proper transform for normal
         uv = texture.xy;
         gl_Position = cameraToClipMatrix * worldToCameraMatrix * modelToWorldMatrix * vec4(position, 1);
     }
@@ -190,16 +223,21 @@ const MESH_FRAGMENT_SHADER_SRC: &str = r#"
     in vec3 n;
     in vec2 uv;
 
-    out vec4 color;
+    out vec4 fragColor;
+    out vec4 fragNormal;
 
     void main() {
+        vec3 normal = normalize(n);
+
         const vec3 diffColor = vec3(0.8);
         const vec3 ambientLight = vec3(0.1,0.1,0.2);
         const vec3 lightDir = vec3(1,1,0);
         const vec3 lightColor = vec3(1.0,1.0,0.5);
-        float ndotl = max(0.0, dot(n, lightDir));
+        float ndotl = max(0.0, dot(normal, lightDir));
         vec3 radiance = (ambientLight + lightColor * ndotl) * diffColor;
-        color = vec4(radiance, 1.0);
+
+        fragColor = vec4(radiance, 1.0);
+        fragNormal = vec4(normal, 0.0);
     }
 "#;
 
@@ -290,15 +328,17 @@ struct RenderResources {
 #[self_referencing]
 struct GBuffer {
     color: Texture2d,
+    normal: Texture2d,
     depth: DepthTexture2d,
-    #[borrows(color, depth)]
+    #[borrows(color, normal, depth)]
     #[covariant]
     framebuffer: MultiOutputFrameBuffer<'this>
 }
 
 struct Particles {
-    particle_pos_buffer: UniformBuffer<[PPos]>,
-    particle_vel_buffer: UniformBuffer<[PVel]>,
+    pos_buffer: UniformBuffer<[PPos]>,
+    vel_buffer: UniformBuffer<[PVel]>,
+    radius_buffer: UniformBuffer<[f32]>,
     debug: UniformBuffer<[[f32; 4]]>
 }
 
@@ -314,11 +354,13 @@ fn main() {
     let mut render_resources = RenderResources {
         g_buffer: GBufferBuilder {
             color: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32, MipmapsOption::NoMipmap, width, height).unwrap(),
+            normal: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32, MipmapsOption::NoMipmap, width, height).unwrap(),
             depth: DepthTexture2d::empty_with_format(&display, DepthFormat::F32, MipmapsOption::NoMipmap, width, height).unwrap(),
-            framebuffer_builder: |color, depth| {
+            framebuffer_builder: |color, normal, depth| {
                 MultiOutputFrameBuffer::with_depth_buffer(&display, 
                     [
-                        ("color", color)
+                        ("fragColor", color),
+                        ("fragNormal", normal)
                     ].iter().cloned(),
                     depth
                 ).unwrap()
@@ -326,8 +368,9 @@ fn main() {
         }.build(),
 
         particles: Particles {
-            particle_pos_buffer: new_particle_buffer(&display),
-            particle_vel_buffer: new_particle_buffer(&display),
+            pos_buffer: new_particle_buffer(&display),
+            vel_buffer: new_particle_buffer(&display),
+            radius_buffer: new_particle_buffer(&display),
             debug: new_particle_buffer(&display)
         },
 
@@ -335,14 +378,29 @@ fn main() {
     };
 
     {
-        let mut mapping = render_resources.particles.particle_pos_buffer.map();
+        let mut mapping = render_resources.particles.pos_buffer.map();
         for val in mapping.iter_mut() {
             *val = [
-                rand::random::<f32>() * 100.0 - 50.0,
-                rand::random::<f32>() * 10.0 - 5.0,
-                rand::random::<f32>() * 100.0 - 50.0,
+                rand::random::<f32>() * 5.0 - 2.5 - 4.0,
+                rand::random::<f32>() * 5.0 - 2.5 - 1.0,
+                rand::random::<f32>() * 5.0 - 2.5,
                 1.0
             ];
+        }
+
+        let mut mapping = render_resources.particles.vel_buffer.map();
+        for val in mapping.iter_mut() {
+            *val = [
+                10.0,
+                0.0,
+                0.0,
+                1.0
+            ];
+        }
+
+        let mut mapping = render_resources.particles.radius_buffer.map();
+        for val in mapping.iter_mut() {
+            *val = rand::random::<f32>() * 0.1 + 0.05;
         }
     }
 
@@ -382,8 +440,8 @@ fn main() {
         *control_flow = glutin::event_loop::ControlFlow::WaitUntil(next_frame_time);
         
         const RADIANS_PER_SEC: f32 = PI / 2.0;
-        let camera_angle = RADIANS_PER_SEC * time.as_secs_f32();
-        camera.pos = Mat3::from_rotation_y(camera_angle) * vec3(0.0, 10.0, 70.0);
+        let camera_angle = RADIANS_PER_SEC * time.as_secs_f32() * 0.0;
+        camera.pos = Mat3::from_rotation_y(camera_angle) * vec3(0.0, 1.0, 7.0);
         camera.rot = Quat::from_rotation_ypr(camera_angle, -30.0*PI/180.0, PI);
         
         let mut target = display.draw();
@@ -423,7 +481,8 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         MESH_VERTEX_SHADER_SRC, MESH_FRAGMENT_SHADER_SRC, None).unwrap();
     render_resources.g_buffer.with_mut(|g_buffer| {
         g_buffer.framebuffer.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
-        render_scene(g_buffer.framebuffer, time, &render_resources.camera_uniforms_buffer, landingpad_mesh, &scene_shader_program);
+        render_scene(g_buffer.framebuffer, time,
+            &render_resources.camera_uniforms_buffer, landingpad_mesh, &scene_shader_program);
     });
 
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
@@ -454,10 +513,12 @@ fn render(display: &glium::Display, target: &mut impl Surface,
             time: time,
             deltaTime: delta_time,
             Camera: &*render_resources.camera_uniforms_buffer,
-            ParticlePositions: &*render_resources.particles.particle_pos_buffer,
-            ParticleVelocities: &*render_resources.particles.particle_vel_buffer,
+            ParticlePositions: &*render_resources.particles.pos_buffer,
+            ParticleVelocities: &*render_resources.particles.vel_buffer,
+            ParticleRadiuses: &*render_resources.particles.radius_buffer,
             DebugOutput: &*render_resources.particles.debug,
-            sceneDepth: render_resources.g_buffer.borrow_depth()
+            sceneDepth: render_resources.g_buffer.borrow_depth(),
+            sceneNormal: render_resources.g_buffer.borrow_normal()
         },
         NUM_PARTICLES as u32, 1, 1
     );
@@ -496,7 +557,8 @@ fn render_particles(display: &glium::Display, target: &mut impl Surface,
         &uniform! {
             time: time,
             Camera: &*render_resources.camera_uniforms_buffer,
-            ParticlePositions: &*render_resources.particles.particle_pos_buffer
+            ParticlePositions: &*render_resources.particles.pos_buffer,
+            ParticleRadiuses: &*render_resources.particles.radius_buffer
         },
         &DrawParameters {
             depth: Depth {
@@ -514,11 +576,20 @@ fn render_scene(target: &mut impl Surface,
     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
     landingpad_mesh: &Mesh,
     scene_shader_program: &Program) {
+    
+    let draw_parameters = DrawParameters {
+        depth: Depth {
+            test: DepthTest::IfLess,
+            write: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let pad_transform = Mat4::from_scale_rotation_translation(
-        vec3(1.0,1.0,1.0),
-        Quat::identity(),
-        vec3(0.0, -30.0, 0.0)
+        vec3(0.1,0.1,0.1),
+        Quat::from_rotation_z(45.0 * PI/180.0),
+        vec3(0.0, -3.0, 0.0)
     );
     target.draw(&landingpad_mesh.vertices, &landingpad_mesh.indices,
         scene_shader_program,
@@ -526,13 +597,20 @@ fn render_scene(target: &mut impl Surface,
             Camera: &*camera_uniforms_buffer,
             modelToWorldMatrix: pad_transform.to_cols_array_2d()
         },
-        &DrawParameters {
-            depth: Depth {
-                test: DepthTest::IfLess,
-                write: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        &draw_parameters
+    ).unwrap();
+
+    let pad_transform = Mat4::from_scale_rotation_translation(
+        vec3(1.0,1.0,1.0),
+        Quat::from_rotation_z(0.0),
+        vec3(0.0, -10.0, 0.0)
+    );
+    target.draw(&landingpad_mesh.vertices, &landingpad_mesh.indices,
+        scene_shader_program,
+        &uniform! {
+            Camera: &*camera_uniforms_buffer,
+            modelToWorldMatrix: pad_transform.to_cols_array_2d()
+        },
+        &draw_parameters
     ).unwrap();
 }
