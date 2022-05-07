@@ -5,14 +5,18 @@ use std::time::Duration;
 use glam::{Mat4, Quat, Vec3, vec3, Mat3};
 use glium::backend::Facade;
 use glium::buffer::Content;
+use glium::framebuffer::MultiOutputFrameBuffer;
 use glium::index::{PrimitiveType, NoIndices, Index};
 use glium::program::ComputeShader;
+use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d};
+use glium::texture::texture2d::Texture2d;
 use glium::vertex::{EmptyVertexAttributes, EmptyInstanceAttributes};
-use glium::{Program, Frame, DrawParameters, DepthTest, Depth};
-use glium::uniforms::UniformBuffer;
+use glium::{Program, Frame, DrawParameters, DepthTest, Depth, BlitMask, BlitTarget, Rect};
+use glium::uniforms::{UniformBuffer, MagnifySamplerFilter};
 use glium::{glutin, Surface, VertexBuffer, IndexBuffer};
 use glium::glutin::dpi::PhysicalSize;
 use rand;
+use ouroboros::self_referencing;
 
 #[macro_use]
 extern crate glium;
@@ -47,6 +51,11 @@ const UPDATE_PARTICLES_SRC: &str = r#"
 
     uniform float time;
     uniform float deltaTime;
+    
+    layout(std140) buffer Camera {
+        mat4 worldToCameraMatrix;
+        mat4 cameraToClipMatrix;
+    };
 
     layout(std140) buffer ParticlePositions {
         vec4 positions[];
@@ -56,15 +65,47 @@ const UPDATE_PARTICLES_SRC: &str = r#"
         vec4 velocities[];
     };
 
+    layout(std140) buffer DebugOutput {
+        vec4 debug[];
+    };
+
+    uniform sampler2D sceneDepth;
+
+    bool isColliding(vec3 pos) {
+        vec4 viewPos = worldToCameraMatrix * vec4(pos, 1.0);
+        vec4 clipPos = cameraToClipMatrix * viewPos;
+        vec2 ndcPos = clipPos.xy / clipPos.w;
+
+        float geometryNdcDepth = texture(sceneDepth, ndcPos * 0.5 + 0.5).x * 2.0 - 1.0;
+        vec4 geometryNdcPos = vec4(ndcPos, geometryNdcDepth, 1.0);
+        vec4 geometryViewPos = inverse(cameraToClipMatrix) * geometryNdcPos;
+        geometryViewPos /= geometryViewPos.w;
+
+        float particleDepth = -viewPos.z;
+        float geometryDepth = -geometryViewPos.z;
+
+        const float PARTICLE_RADIUS = 0.5;
+        return abs(particleDepth - geometryDepth) <= PARTICLE_RADIUS;
+    }
+
     void main() {
+        //positions[gl_GlobalInvocationID.x] = vec4(0.0, 0.0, 0.0, 1.0);
+
         vec3 pos = positions[gl_GlobalInvocationID.x].xyz;
         vec3 vel = velocities[gl_GlobalInvocationID.x].xyz;
         
-        vel += vec3(0,-9.82,0);
+        // Apply impulses
+        vel += vec3(0.0, -9.82, 0.0) * deltaTime;
+
+        if (isColliding(pos)) {
+            vel = vec3(0.0, 10.0, 0.0);
+        }
+
+        // Move by current velocity
         pos += vel * deltaTime; // TODO: Euler integration?
 
-        positions[gl_GlobalInvocationID.x] = vec4(pos, 1);
-        velocities[gl_GlobalInvocationID.x] = vec4(vel, 1);
+        positions[gl_GlobalInvocationID.x] = vec4(pos, 1.0);
+        velocities[gl_GlobalInvocationID.x] = vec4(vel, 1.0);
     }
 "#;
 
@@ -162,9 +203,44 @@ const MESH_FRAGMENT_SHADER_SRC: &str = r#"
     }
 "#;
 
+const FULLSCREEN_VERTEX_SHADER_SRC: &str = r#"
+    #version 430
+
+    out vec2 uv;
+
+    void main() {
+        // Adapted from https://www.slideshare.net/DevCentralAMD/vertex-shader-tricks-bill-bilodeau
+        gl_Position = vec4(
+            vec2(gl_VertexID / 2, gl_VertexID % 2) * 4.0 - 1.0,
+            0.0,
+            1.0
+        );
+        uv = vec2(
+            (gl_VertexID / 2) * 2.0,
+            (gl_VertexID % 2) * 2.0
+        );
+    }
+"#;
+
+const BLIT_FRAGMENT_SHADER_SRC: &str = r#"
+    #version 430
+
+    uniform sampler2D blit_source_color;
+    uniform sampler2D blit_source_depth;
+
+    in vec2 uv;
+    out vec4 color;
+
+    void main() {
+        color = texture(blit_source_color, uv);
+        gl_FragDepth = texture(blit_source_depth, uv).x;
+    }
+"#;
+
+
 fn new_particle_buffer<T>(facade: &impl Facade)
                         -> UniformBuffer<[T]> where [T]: Content {
-    UniformBuffer::<[T]>::empty_unsized(facade,
+    UniformBuffer::empty_unsized(facade,
         NUM_PARTICLES * size_of::<T>()).unwrap()
 }
 
@@ -205,18 +281,61 @@ impl Mesh {
 }
 
 
+struct RenderResources {
+    g_buffer: GBuffer,
+    camera_uniforms_buffer: UniformBuffer<CameraUniforms>,
+    particles: Particles,
+}
+
+#[self_referencing]
+struct GBuffer {
+    color: Texture2d,
+    depth: DepthTexture2d,
+    #[borrows(color, depth)]
+    #[covariant]
+    framebuffer: MultiOutputFrameBuffer<'this>
+}
+
+struct Particles {
+    particle_pos_buffer: UniformBuffer<[PPos]>,
+    particle_vel_buffer: UniformBuffer<[PVel]>,
+    debug: UniformBuffer<[[f32; 4]]>
+}
+
+
 fn main() {
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new()
         .with_inner_size(PhysicalSize::new(1280u32, 720u32));
     let cb = glutin::ContextBuilder::new();
     let display = glium::Display::new(wb, cb, &event_loop).unwrap();
+    
+    let (width, height) = display.get_framebuffer_dimensions();
+    let mut render_resources = RenderResources {
+        g_buffer: GBufferBuilder {
+            color: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32, MipmapsOption::NoMipmap, width, height).unwrap(),
+            depth: DepthTexture2d::empty_with_format(&display, DepthFormat::F32, MipmapsOption::NoMipmap, width, height).unwrap(),
+            framebuffer_builder: |color, depth| {
+                MultiOutputFrameBuffer::with_depth_buffer(&display, 
+                    [
+                        ("color", color)
+                    ].iter().cloned(),
+                    depth
+                ).unwrap()
+            },
+        }.build(),
 
-    let mut particle_pos_buffer: UniformBuffer<[PPos]> = new_particle_buffer(&display);
-    let mut particle_vel_buffer: UniformBuffer<[PVel]> = new_particle_buffer(&display);
+        particles: Particles {
+            particle_pos_buffer: new_particle_buffer(&display),
+            particle_vel_buffer: new_particle_buffer(&display),
+            debug: new_particle_buffer(&display)
+        },
+
+        camera_uniforms_buffer: UniformBuffer::empty(&display).unwrap()
+    };
 
     {
-        let mut mapping = particle_pos_buffer.map();
+        let mut mapping = render_resources.particles.particle_pos_buffer.map();
         for val in mapping.iter_mut() {
             *val = [
                 rand::random::<f32>() * 100.0 - 50.0,
@@ -226,9 +345,6 @@ fn main() {
             ];
         }
     }
-
-    let mut camera_uniforms_buffer =
-              UniformBuffer::<CameraUniforms>::empty(&display).unwrap();
 
     let mut camera = Camera {
         pos: vec3(0.0,0.0,10.0),
@@ -272,15 +388,15 @@ fn main() {
         
         let mut target = display.draw();
 
-        let (width, height) = target.get_dimensions();
-        camera.aspect_ratio = width as f32 / height as f32;
+        camera.aspect_ratio = {
+            let (width, height) = target.get_dimensions();
+            width as f32 / height as f32
+        };
 
         render(&display, &mut target,
             time.as_secs_f32(), FRAME_DURATION.as_secs_f32(),
             &camera,
-            &mut camera_uniforms_buffer,
-            &mut particle_pos_buffer,
-            &mut particle_vel_buffer,
+            &mut render_resources,
             &landingpad_mesh);
 
         target.finish().unwrap();
@@ -289,40 +405,42 @@ fn main() {
     });
 }
 
-fn render(display: &glium::Display, target: &mut Frame,
-    time: f32, delta_time: f32,
-    camera: &Camera,
-    camera_uniforms_buffer: &mut UniformBuffer<CameraUniforms>,
-    particle_pos_buffer: &mut UniformBuffer<[PPos]>,
-    particle_vel_buffer: &mut UniformBuffer<[PVel]>,
-    landingpad_mesh: &Mesh) {
-    
+fn render(display: &glium::Display, target: &mut impl Surface,
+            time: f32, delta_time: f32,
+            camera: &Camera,
+            render_resources: &mut RenderResources,
+            landingpad_mesh: &Mesh) {
+
     {
-        let mut mapping = camera_uniforms_buffer.map_write();
+        let mut mapping = render_resources.camera_uniforms_buffer.map_write();
         mapping.write(CameraUniforms {
             worldToCameraMatrix: (Mat4::from_translation(camera.pos) * Mat4::from_quat(camera.rot)).inverse().to_cols_array_2d(),
             cameraToClipMatrix: Mat4::perspective_rh_gl(camera.fov, camera.aspect_ratio, camera.z_near, camera.z_far).to_cols_array_2d()
         });
     }
-        
+
+    let scene_shader_program = Program::from_source(display,
+        MESH_VERTEX_SHADER_SRC, MESH_FRAGMENT_SHADER_SRC, None).unwrap();
+    render_resources.g_buffer.with_mut(|g_buffer| {
+        g_buffer.framebuffer.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
+        render_scene(g_buffer.framebuffer, time, &render_resources.camera_uniforms_buffer, landingpad_mesh, &scene_shader_program);
+    });
+
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
 
     let program = Program::from_source(display,
-        MESH_VERTEX_SHADER_SRC, MESH_FRAGMENT_SHADER_SRC, None).unwrap();
-    let pad_transform = Mat4::from_scale_rotation_translation(
-        vec3(1.0,1.0,1.0),
-        Quat::identity(),
-        vec3(0.0, -30.0, 0.0)
-    );
-    target.draw(&landingpad_mesh.vertices, &landingpad_mesh.indices,
+        FULLSCREEN_VERTEX_SHADER_SRC, BLIT_FRAGMENT_SHADER_SRC, None).unwrap();
+    target.draw(
+        EmptyVertexAttributes { len: 3 },
+        NoIndices(PrimitiveType::TrianglesList),
         &program,
         &uniform! {
-            Camera: &*camera_uniforms_buffer,
-            modelToWorldMatrix: pad_transform.to_cols_array_2d()
+            blit_source_color: render_resources.g_buffer.borrow_color(),
+            blit_source_depth: render_resources.g_buffer.borrow_depth()
         },
         &DrawParameters {
             depth: Depth {
-                test: DepthTest::IfLess,
+                test: DepthTest::Overwrite, 
                 write: true,
                 ..Default::default()
             },
@@ -335,22 +453,39 @@ fn render(display: &glium::Display, target: &mut Frame,
         uniform! {
             time: time,
             deltaTime: delta_time,
-            ParticlePositions: &*particle_pos_buffer,
-            ParticleVelocities: &*particle_vel_buffer
+            Camera: &*render_resources.camera_uniforms_buffer,
+            ParticlePositions: &*render_resources.particles.particle_pos_buffer,
+            ParticleVelocities: &*render_resources.particles.particle_vel_buffer,
+            DebugOutput: &*render_resources.particles.debug,
+            sceneDepth: render_resources.g_buffer.borrow_depth()
         },
         NUM_PARTICLES as u32, 1, 1
     );
 
     /* {
-        let mapping = buffer.map();
-        for val in mapping.iter().take(3) {
+        let mapping = render_resources.particles.particle_pos_buffer.map();
+        for val in mapping.iter().take(1) {
             println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
         }
         println!("...");
     } */
+    {
+        let mapping = render_resources.particles.debug.map();
+        for val in mapping.iter().take(1) {
+            println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
+        }
+        println!("...");
+    }
 
+    render_particles(display, target, time, render_resources);
+}
+
+fn render_particles(display: &glium::Display, target: &mut impl Surface,
+                    time: f32,
+                    render_resources: &mut RenderResources) {
+    
     let program = Program::from_source(display, VERTEX_SHADER_SRC,
-                                                FRAGMENT_SHADER_SRC, None).unwrap();
+                                            FRAGMENT_SHADER_SRC, None).unwrap();
     target.draw(
         (
             EmptyVertexAttributes { len: 4 },
@@ -360,8 +495,36 @@ fn render(display: &glium::Display, target: &mut Frame,
         &program,
         &uniform! {
             time: time,
+            Camera: &*render_resources.camera_uniforms_buffer,
+            ParticlePositions: &*render_resources.particles.particle_pos_buffer
+        },
+        &DrawParameters {
+            depth: Depth {
+                test: DepthTest::IfLess,
+                write: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    ).unwrap();
+}
+
+fn render_scene(target: &mut impl Surface,
+    time: f32,
+    camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+    landingpad_mesh: &Mesh,
+    scene_shader_program: &Program) {
+
+    let pad_transform = Mat4::from_scale_rotation_translation(
+        vec3(1.0,1.0,1.0),
+        Quat::identity(),
+        vec3(0.0, -30.0, 0.0)
+    );
+    target.draw(&landingpad_mesh.vertices, &landingpad_mesh.indices,
+        scene_shader_program,
+        &uniform! {
             Camera: &*camera_uniforms_buffer,
-            ParticlePositions: &*particle_pos_buffer
+            modelToWorldMatrix: pad_transform.to_cols_array_2d()
         },
         &DrawParameters {
             depth: Depth {
