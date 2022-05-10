@@ -52,24 +52,40 @@ const UPDATE_PARTICLES_SRC: &str = r#"
     uniform float time;
     uniform float deltaTime;
     
-    layout(std140) buffer Camera {
+    layout(std140) restrict readonly buffer Camera {
         mat4 worldToCameraMatrix;
         mat4 cameraToClipMatrix;
     };
 
-    layout(std140) buffer ParticlePositions {
+    layout(std140) restrict buffer AliveCount {
+        uint aliveCount;
+    };
+
+    layout(std140) restrict readonly buffer PrevPositions {
+        vec4 prevPositions[];
+    };
+
+    layout(std140) restrict readonly buffer PrevVelocities {
+        vec4 prevVelocities[];
+    };
+
+    layout(std140) restrict readonly buffer PrevRadiuses {
+        float prevRadiuses[];
+    };
+
+    layout(std140) restrict writeonly buffer Positions {
         vec4 positions[];
     };
 
-    layout(std140) buffer ParticleVelocities {
+    layout(std140) restrict writeonly buffer Velocities {
         vec4 velocities[];
     };
 
-    layout(std140) buffer ParticleRadiuses {
+    layout(std140) restrict writeonly buffer Radiuses {
         float radiuses[];
     };
 
-    layout(std140) buffer DebugOutput {
+    layout(std140) restrict writeonly buffer DebugOutput {
         vec4 debug[];
     };
 
@@ -112,12 +128,19 @@ const UPDATE_PARTICLES_SRC: &str = r#"
         return CollisionQuery(true, coll);
     }
 
-    void main() {
-        //positions[gl_GlobalInvocationID.x] = vec4(0.0, 0.0, 0.0, 1.0);
+    void emitParticle(vec3 pos, vec3 vel, float radius) {
+        uint nextIndex = atomicAdd(aliveCount, 1);
+        //uint nextIndex = gl_GlobalInvocationID.x;
 
-        vec3 p0 = positions[gl_GlobalInvocationID.x].xyz;
-        vec3 v0 = velocities[gl_GlobalInvocationID.x].xyz;
-        float radius = radiuses[gl_GlobalInvocationID.x];
+        positions[nextIndex] = vec4(pos, 1.0);
+        velocities[nextIndex] = vec4(vel, 1.0);
+        radiuses[nextIndex] = radius;
+    }
+
+    void main() {
+        vec3 p0 = prevPositions[gl_GlobalInvocationID.x].xyz;
+        vec3 v0 = prevVelocities[gl_GlobalInvocationID.x].xyz;
+        float radius = prevRadiuses[gl_GlobalInvocationID.x];
         
         // Apply impluses // TODO: Before or after?
         vec3 v1 = v0 + vec3(0.0, -9.82, 0.0) * deltaTime; // TODO: Euler integration?
@@ -130,9 +153,50 @@ const UPDATE_PARTICLES_SRC: &str = r#"
             const float RESTITUTION = 0.9;
             v1 = reflect(v1, query.collision.normal) * RESTITUTION;
         }
+        
+        emitParticle(p1, v1, radius);
+    }
+"#;
 
-        positions[gl_GlobalInvocationID.x] = vec4(p1, 1.0);
-        velocities[gl_GlobalInvocationID.x] = vec4(v1, 1.0);
+const SPAWN_PARTICLES_SRC: &str = r#"
+    #version 430
+
+    layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+    
+    layout(std140) restrict readonly buffer Camera {
+        mat4 worldToCameraMatrix;
+        mat4 cameraToClipMatrix;
+    };
+
+    layout(std140) restrict buffer AliveCount {
+        uint aliveCount;
+    };
+
+    layout(std140) restrict writeonly buffer Positions {
+        vec4 positions[];
+    };
+
+    layout(std140) restrict writeonly buffer Velocities {
+        vec4 velocities[];
+    };
+
+    layout(std140) restrict writeonly buffer Radiuses {
+        float radiuses[];
+    };
+
+    uniform sampler2D sceneDepth;
+    uniform sampler2D sceneNormal;
+
+    void emitParticle(vec3 pos, vec3 vel, float radius) {
+        uint nextIndex = atomicAdd(aliveCount, 1);
+
+        positions[nextIndex] = vec4(pos, 1.0);
+        velocities[nextIndex] = vec4(vel, 1.0);
+        radiuses[nextIndex] = radius;
+    }
+
+    void main() {
+        emitParticle(vec3(0), vec3(0,3,0), 0.1);
     }
 "#;
 
@@ -322,7 +386,7 @@ impl Mesh {
 struct RenderResources {
     g_buffer: GBuffer,
     camera_uniforms_buffer: UniformBuffer<CameraUniforms>,
-    particles: Particles,
+    particles: ParticleSystem,
 }
 
 #[self_referencing]
@@ -334,6 +398,20 @@ struct GBuffer {
     #[covariant]
     framebuffer: MultiOutputFrameBuffer<'this>
 }
+
+struct ParticleSystem {
+    alive_count: UniformBuffer<AliveCount>,
+    current: Particles,
+    prev: Particles
+}
+
+#[allow(non_snake_case)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AliveCount {
+    aliveCount: u32
+}
+implement_uniform_block!(AliveCount, aliveCount);
 
 struct Particles {
     pos_buffer: UniformBuffer<[PPos]>,
@@ -353,9 +431,12 @@ fn main() {
     let (width, height) = display.get_framebuffer_dimensions();
     let mut render_resources = RenderResources {
         g_buffer: GBufferBuilder {
-            color: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32, MipmapsOption::NoMipmap, width, height).unwrap(),
-            normal: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32, MipmapsOption::NoMipmap, width, height).unwrap(),
-            depth: DepthTexture2d::empty_with_format(&display, DepthFormat::F32, MipmapsOption::NoMipmap, width, height).unwrap(),
+            color: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32,
+                MipmapsOption::NoMipmap, width, height).unwrap(),
+            normal: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32,
+                MipmapsOption::NoMipmap, width, height).unwrap(),
+            depth: DepthTexture2d::empty_with_format(&display, DepthFormat::F32,
+                MipmapsOption::NoMipmap, width, height).unwrap(),
             framebuffer_builder: |color, normal, depth| {
                 MultiOutputFrameBuffer::with_depth_buffer(&display, 
                     [
@@ -367,18 +448,29 @@ fn main() {
             },
         }.build(),
 
-        particles: Particles {
-            pos_buffer: new_particle_buffer(&display),
-            vel_buffer: new_particle_buffer(&display),
-            radius_buffer: new_particle_buffer(&display),
-            debug: new_particle_buffer(&display)
+        particles: ParticleSystem {
+            alive_count: UniformBuffer::new(&display, AliveCount { aliveCount: 0 }).unwrap(),
+            current: Particles {
+                pos_buffer: new_particle_buffer(&display),
+                vel_buffer: new_particle_buffer(&display),
+                radius_buffer: new_particle_buffer(&display),
+                debug: new_particle_buffer(&display)
+            },
+            prev: Particles {
+                pos_buffer: new_particle_buffer(&display),
+                vel_buffer: new_particle_buffer(&display),
+                radius_buffer: new_particle_buffer(&display),
+                debug: new_particle_buffer(&display)
+            }
         },
 
         camera_uniforms_buffer: UniformBuffer::empty(&display).unwrap()
     };
 
     {
-        let mut mapping = render_resources.particles.pos_buffer.map();
+        let particles = &mut render_resources.particles.current;
+
+        let mut mapping = particles.pos_buffer.map();
         for val in mapping.iter_mut() {
             *val = [
                 rand::random::<f32>() * 5.0 - 2.5 - 4.0,
@@ -388,7 +480,7 @@ fn main() {
             ];
         }
 
-        let mut mapping = render_resources.particles.vel_buffer.map();
+        let mut mapping = particles.vel_buffer.map();
         for val in mapping.iter_mut() {
             *val = [
                 10.0,
@@ -398,10 +490,13 @@ fn main() {
             ];
         }
 
-        let mut mapping = render_resources.particles.radius_buffer.map();
+        let mut mapping = particles.radius_buffer.map();
         for val in mapping.iter_mut() {
-            *val = rand::random::<f32>() * 0.1 + 0.05;
+            *val = rand::random::<f32>() * 0.1 + 1.05;
         }
+
+        //render_resources.particles.alive_count.write(&AliveCount { aliveCount: NUM_PARTICLES as u32 });
+        render_resources.particles.alive_count.write(&AliveCount { aliveCount: 0 });
     }
 
     let mut camera = Camera {
@@ -488,7 +583,8 @@ fn render(display: &glium::Display, target: &mut impl Surface,
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
 
     let program = Program::from_source(display,
-        FULLSCREEN_VERTEX_SHADER_SRC, BLIT_FRAGMENT_SHADER_SRC, None).unwrap();
+        FULLSCREEN_VERTEX_SHADER_SRC,
+        BLIT_FRAGMENT_SHADER_SRC, None).unwrap();
     target.draw(
         EmptyVertexAttributes { len: 3 },
         NoIndices(PrimitiveType::TrianglesList),
@@ -507,58 +603,138 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         }
     ).unwrap();
 
+    let system = &mut render_resources.particles;
+
+    update_particles(
+        display,
+        system,
+        &render_resources.camera_uniforms_buffer,
+        &render_resources.g_buffer,
+        time, delta_time
+    );
+
+    spawn_particles(
+        display,
+        system,
+        &render_resources.camera_uniforms_buffer,
+        &render_resources.g_buffer,
+        time, delta_time
+    );
+
+    // TODO: Avoid reading back particle count to CPU, use indirect draw?
+    let alive_count = system.alive_count.read().unwrap().aliveCount as usize;
+    render_particles(
+        display, target,
+        &render_resources.particles.current,
+        alive_count,
+        &render_resources.camera_uniforms_buffer,
+        time
+    );
+}
+
+fn update_particles(display: &glium::Display,
+                    system: &mut ParticleSystem,
+                    camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+                    g_buffer: &GBuffer,
+                    time: f32, delta_time: f32) {
+
+    std::mem::swap(&mut system.current, &mut system.prev);
+
+    // TODO: Avoid reading back particle count to CPU, use indirect dispatch?
+    let alive_count = system.alive_count.read().unwrap().aliveCount;
+    system.alive_count.write(&AliveCount { aliveCount: 0 });
+    
     let program = ComputeShader::from_source(display, UPDATE_PARTICLES_SRC).unwrap();
     program.execute(
         uniform! {
             time: time,
             deltaTime: delta_time,
-            Camera: &*render_resources.camera_uniforms_buffer,
-            ParticlePositions: &*render_resources.particles.pos_buffer,
-            ParticleVelocities: &*render_resources.particles.vel_buffer,
-            ParticleRadiuses: &*render_resources.particles.radius_buffer,
-            DebugOutput: &*render_resources.particles.debug,
-            sceneDepth: render_resources.g_buffer.borrow_depth(),
-            sceneNormal: render_resources.g_buffer.borrow_normal()
+            Camera: &*camera_uniforms_buffer,
+
+            AliveCount: &*system.alive_count,
+
+            PrevPositions: &*system.prev.pos_buffer,
+            PrevVelocities: &*system.prev.vel_buffer,
+            PrevRadiuses: &*system.prev.radius_buffer,
+
+            Positions: &*system.current.pos_buffer,
+            Velocities: &*system.current.vel_buffer,
+            Radiuses: &*system.current.radius_buffer,
+            DebugOutput: &*system.current.debug,
+
+            sceneDepth: g_buffer.borrow_depth(),
+            sceneNormal: g_buffer.borrow_normal()
         },
-        NUM_PARTICLES as u32, 1, 1
+        alive_count, 1, 1
     );
 
     /* {
-        let mapping = render_resources.particles.particle_pos_buffer.map();
+        let mapping = system.current.pos_buffer.map();
         for val in mapping.iter().take(1) {
             println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
         }
         println!("...");
     } */
-    {
-        let mapping = render_resources.particles.debug.map();
+
+    println!("After update: {}", system.alive_count.read().unwrap().aliveCount);
+
+    /* {
+        let mapping = system.current.debug.map_read();
         for val in mapping.iter().take(1) {
             println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
         }
         println!("...");
-    }
+    } */
+}
 
-    render_particles(display, target, time, render_resources);
+fn spawn_particles(display: &glium::Display,
+                    system: &mut ParticleSystem,
+                    camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+                    g_buffer: &GBuffer,
+                    time: f32, delta_time: f32) {
+    
+    let program = ComputeShader::from_source(display, SPAWN_PARTICLES_SRC).unwrap();
+    program.execute(
+        uniform! {
+            time: time,
+            deltaTime: delta_time,
+            Camera: &*camera_uniforms_buffer,
+
+            AliveCount: &*system.alive_count,
+
+            Positions: &*system.current.pos_buffer,
+            Velocities: &*system.current.vel_buffer,
+            Radiuses: &*system.current.radius_buffer,
+
+            sceneDepth: g_buffer.borrow_depth(),
+            sceneNormal: g_buffer.borrow_normal()
+        },
+        1, 1, 1
+    );
+
+    println!("After spawn: {}", system.alive_count.read().unwrap().aliveCount);
 }
 
 fn render_particles(display: &glium::Display, target: &mut impl Surface,
-                    time: f32,
-                    render_resources: &mut RenderResources) {
-    
+                    particles: &Particles,
+                    alive_count: usize,
+                    camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+                    time: f32) {
+
     let program = Program::from_source(display, VERTEX_SHADER_SRC,
                                             FRAGMENT_SHADER_SRC, None).unwrap();
     target.draw(
         (
             EmptyVertexAttributes { len: 4 },
-            EmptyInstanceAttributes { len: NUM_PARTICLES }
+            EmptyInstanceAttributes { len: alive_count }
         ),
         NoIndices(PrimitiveType::TriangleStrip),
         &program,
         &uniform! {
             time: time,
-            Camera: &*render_resources.camera_uniforms_buffer,
-            ParticlePositions: &*render_resources.particles.pos_buffer,
-            ParticleRadiuses: &*render_resources.particles.radius_buffer
+            Camera: &*camera_uniforms_buffer,
+            ParticlePositions: &*particles.pos_buffer,
+            ParticleRadiuses: &*particles.radius_buffer
         },
         &DrawParameters {
             depth: Depth {
