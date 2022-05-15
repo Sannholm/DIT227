@@ -1,3 +1,5 @@
+mod mesh;
+
 use std::f32::consts::PI;
 use std::mem::size_of;
 use std::time::Duration;
@@ -6,34 +8,27 @@ use glam::{Mat4, Quat, Vec3, vec3, Mat3};
 use glium::backend::Facade;
 use glium::buffer::Content;
 use glium::framebuffer::MultiOutputFrameBuffer;
-use glium::index::{PrimitiveType, NoIndices, Index};
+use glium::index::{PrimitiveType, NoIndices};
 use glium::program::ComputeShader;
 use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d};
 use glium::texture::texture2d::Texture2d;
 use glium::vertex::{EmptyVertexAttributes, EmptyInstanceAttributes};
-use glium::{Program, Frame, DrawParameters, DepthTest, Depth, BlitMask, BlitTarget, Rect};
-use glium::uniforms::{UniformBuffer, MagnifySamplerFilter};
-use glium::{glutin, Surface, VertexBuffer, IndexBuffer};
+use glium::{Program, DrawParameters, DepthTest, Depth};
+use glium::uniforms::{UniformBuffer};
+use glium::{glutin, Surface};
 use glium::glutin::dpi::PhysicalSize;
+use mesh::Mesh;
 use rand;
 use ouroboros::self_referencing;
 
 #[macro_use]
 extern crate glium;
 
-const NUM_PARTICLES: usize = 4096;
-
-type PPos = [f32; 4];
-type PVel = [f32; 4];
-
-#[allow(non_snake_case)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CameraUniforms {
-    worldToCameraMatrix: [[f32; 4]; 4],
-    cameraToClipMatrix: [[f32; 4]; 4]
+macro_rules! include_shader {
+    ($path:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/shaders/", $path))
+    };
 }
-implement_uniform_block!(CameraUniforms, worldToCameraMatrix, cameraToClipMatrix);
 
 struct Camera {
     pos: Vec3,
@@ -44,350 +39,20 @@ struct Camera {
     z_far: f32
 }
 
-const UPDATE_PARTICLES_SRC: &str = r#"
-    #version 430
-
-    layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
-
-    uniform float time;
-    uniform float deltaTime;
-    
-    layout(std140) restrict readonly buffer Camera {
-        mat4 worldToCameraMatrix;
-        mat4 cameraToClipMatrix;
-    };
-
-    layout(std140) restrict buffer AliveCount {
-        uint aliveCount;
-    };
-
-    layout(std140) restrict readonly buffer PrevPositions {
-        vec4 prevPositions[];
-    };
-
-    layout(std140) restrict readonly buffer PrevVelocities {
-        vec4 prevVelocities[];
-    };
-
-    layout(std140) restrict readonly buffer PrevRadiuses {
-        float prevRadiuses[];
-    };
-
-    layout(std140) restrict writeonly buffer Positions {
-        vec4 positions[];
-    };
-
-    layout(std140) restrict writeonly buffer Velocities {
-        vec4 velocities[];
-    };
-
-    layout(std140) restrict writeonly buffer Radiuses {
-        float radiuses[];
-    };
-
-    layout(std140) restrict writeonly buffer DebugOutput {
-        vec4 debug[];
-    };
-
-    uniform sampler2D sceneDepth;
-    uniform sampler2D sceneNormal;
-
-    struct Collision {
-        vec3 pos;
-        vec3 normal;
-    };
-    const Collision DUMMY_COLLISION = Collision(vec3(0.0), vec3(0.0));
-
-    struct CollisionQuery {
-        bool colliding;
-        Collision collision;
-    };
-
-    CollisionQuery checkCollision(vec3 pos, float radius) {
-        vec4 viewPos = worldToCameraMatrix * vec4(pos, 1.0);
-        vec4 clipPos = cameraToClipMatrix * viewPos;
-        vec2 ndcPos = clipPos.xy / clipPos.w;
-
-        float geometryNdcDepth = texture(sceneDepth, ndcPos * 0.5 + 0.5).x * 2.0 - 1.0;
-        vec4 geometryNdcPos = vec4(ndcPos, geometryNdcDepth, 1.0);
-        vec4 geometryViewPos = inverse(cameraToClipMatrix) * geometryNdcPos;
-        geometryViewPos /= geometryViewPos.w;
-
-        float particleDepth = -viewPos.z;
-        float geometryDepth = -geometryViewPos.z;
-
-        if (abs(particleDepth - geometryDepth) > radius) {
-            return CollisionQuery(false, DUMMY_COLLISION);
-        }
-
-        vec3 geometryNormal = normalize(texture(sceneNormal, ndcPos * 0.5 + 0.5).xyz);
-
-        Collision coll;
-        coll.pos = vec3(0); // TODO
-        coll.normal = geometryNormal;
-        return CollisionQuery(true, coll);
-    }
-
-    void emitParticle(vec3 pos, vec3 vel, float radius) {
-        uint nextIndex = atomicAdd(aliveCount, 1);
-        //uint nextIndex = gl_GlobalInvocationID.x;
-
-        positions[nextIndex] = vec4(pos, 1.0);
-        velocities[nextIndex] = vec4(vel, 1.0);
-        radiuses[nextIndex] = radius;
-    }
-
-    void main() {
-        vec3 p0 = prevPositions[gl_GlobalInvocationID.x].xyz;
-        vec3 v0 = prevVelocities[gl_GlobalInvocationID.x].xyz;
-        float radius = prevRadiuses[gl_GlobalInvocationID.x];
-        
-        // Apply impluses // TODO: Before or after?
-        vec3 v1 = v0 + vec3(0.0, -9.82, 0.0) * deltaTime; // TODO: Euler integration?
-        vec3 p1 = p0 + v1 * deltaTime; // TODO: Euler integration?
-
-        CollisionQuery query = checkCollision(p1, radius);
-        if (query.colliding) {
-            // Collision response
-            p1 = p0; // TODO: More accurately find intersection point
-            const float RESTITUTION = 0.9;
-            v1 = reflect(v1, query.collision.normal) * RESTITUTION;
-        }
-        
-        emitParticle(p1, v1, radius);
-    }
-"#;
-
-const SPAWN_PARTICLES_SRC: &str = r#"
-    #version 430
-
-    layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
-    
-    layout(std140) restrict readonly buffer Camera {
-        mat4 worldToCameraMatrix;
-        mat4 cameraToClipMatrix;
-    };
-
-    layout(std140) restrict buffer AliveCount {
-        uint aliveCount;
-    };
-
-    layout(std140) restrict writeonly buffer Positions {
-        vec4 positions[];
-    };
-
-    layout(std140) restrict writeonly buffer Velocities {
-        vec4 velocities[];
-    };
-
-    layout(std140) restrict writeonly buffer Radiuses {
-        float radiuses[];
-    };
-
-    uniform sampler2D sceneDepth;
-    uniform sampler2D sceneNormal;
-
-    void emitParticle(vec3 pos, vec3 vel, float radius) {
-        uint nextIndex = atomicAdd(aliveCount, 1);
-
-        positions[nextIndex] = vec4(pos, 1.0);
-        velocities[nextIndex] = vec4(vel, 1.0);
-        radiuses[nextIndex] = radius;
-    }
-
-    void main() {
-        emitParticle(vec3(0), vec3(0,3,0), 0.1);
-    }
-"#;
-
-const VERTEX_SHADER_SRC: &str = r#"
-    #version 430
-
-    const vec2 OFFSETS[] = vec2[4](
-        vec2(-0.5,  0.5),
-        vec2(-0.5, -0.5),
-        vec2(0.5,   0.5),
-        vec2(0.5,  -0.5)
-    );
-
-    layout(std140) buffer Camera {
-        mat4 worldToCameraMatrix;
-        mat4 cameraToClipMatrix;
-    };
-    const vec3 cameraPos = inverse(worldToCameraMatrix)[3].xyz;
-
-    layout(std140) buffer ParticlePositions {
-        vec4 positions[];
-    };
-
-    layout(std140) buffer ParticleRadiuses {
-        float radiuses[];
-    };
-
-    out vec2 uv;
-
-    void main() {
-        vec3 particlePos = positions[gl_InstanceID].xyz;
-        float particleRadius = radiuses[gl_InstanceID];
-
-        vec3 normal = normalize(cameraPos - particlePos); // Viewpoint-facing
-        //normal = normalize(inverse(mat3(worldToCameraMatrix)) * vec3(0, 0, 1)); // Viewplane-facing
-        
-        vec3 upBasis = vec3(0, 1, 0);
-        vec3 rightBasis = normalize(cross(upBasis, normal));
-        upBasis = cross(rightBasis, normal);
-        mat3 billboardMatrix = mat3(rightBasis, upBasis, normal);
-
-        vec2 offset = OFFSETS[gl_VertexID];
-        vec3 vertexPos = particlePos + billboardMatrix * vec3(offset * particleRadius, 0);
-
-        uv = offset + vec2(0.5);
-        gl_Position = cameraToClipMatrix * worldToCameraMatrix * vec4(vertexPos, 1);
-    }
-"#;
-
-const FRAGMENT_SHADER_SRC: &str = r#"
-    #version 430
-
-    in vec2 uv;
-    out vec4 color;
-
-    void main() {
-        color = vec4(uv, 0.0, 1.0);
-    }
-"#;
-
-const MESH_VERTEX_SHADER_SRC: &str = r#"
-    #version 430
-
-    layout(std140) buffer Camera {
-        mat4 worldToCameraMatrix;
-        mat4 cameraToClipMatrix;
-    };
-
-    uniform mat4 modelToWorldMatrix;
-
-    in vec3 position;
-    in vec3 normal;
-    in vec3 texture;
-    
-    out vec3 n;
-    out vec2 uv;
-
-    void main() {
-        n = (modelToWorldMatrix * vec4(normal, 0.0)).xyz; // TODO: Proper transform for normal
-        uv = texture.xy;
-        gl_Position = cameraToClipMatrix * worldToCameraMatrix * modelToWorldMatrix * vec4(position, 1);
-    }
-"#;
-
-const MESH_FRAGMENT_SHADER_SRC: &str = r#"
-    #version 430
-
-    in vec3 n;
-    in vec2 uv;
-
-    out vec4 fragColor;
-    out vec4 fragNormal;
-
-    void main() {
-        vec3 normal = normalize(n);
-
-        const vec3 diffColor = vec3(0.8);
-        const vec3 ambientLight = vec3(0.1,0.1,0.2);
-        const vec3 lightDir = vec3(1,1,0);
-        const vec3 lightColor = vec3(1.0,1.0,0.5);
-        float ndotl = max(0.0, dot(normal, lightDir));
-        vec3 radiance = (ambientLight + lightColor * ndotl) * diffColor;
-
-        fragColor = vec4(radiance, 1.0);
-        fragNormal = vec4(normal, 0.0);
-    }
-"#;
-
-const FULLSCREEN_VERTEX_SHADER_SRC: &str = r#"
-    #version 430
-
-    out vec2 uv;
-
-    void main() {
-        // Adapted from https://www.slideshare.net/DevCentralAMD/vertex-shader-tricks-bill-bilodeau
-        gl_Position = vec4(
-            vec2(gl_VertexID / 2, gl_VertexID % 2) * 4.0 - 1.0,
-            0.0,
-            1.0
-        );
-        uv = vec2(
-            (gl_VertexID / 2) * 2.0,
-            (gl_VertexID % 2) * 2.0
-        );
-    }
-"#;
-
-const BLIT_FRAGMENT_SHADER_SRC: &str = r#"
-    #version 430
-
-    uniform sampler2D blit_source_color;
-    uniform sampler2D blit_source_depth;
-
-    in vec2 uv;
-    out vec4 color;
-
-    void main() {
-        color = texture(blit_source_color, uv);
-        gl_FragDepth = texture(blit_source_depth, uv).x;
-    }
-"#;
-
-
-fn new_particle_buffer<T>(facade: &impl Facade)
-                        -> UniformBuffer<[T]> where [T]: Content {
-    UniformBuffer::empty_unsized(facade,
-        NUM_PARTICLES * size_of::<T>()).unwrap()
-}
-
-struct Mesh {
-    pub vertices: VertexBuffer<MeshVertex>,
-    pub indices: IndexBuffer<u32>
-}
-
-#[derive(Copy, Clone)]
-pub struct MeshVertex {
-    /// Position vector of a vertex.
-    pub position: [f32; 3],
-    /// Normal vertor of a vertex.
-    pub normal: [f32; 3],
-    /// Texture of a vertex.
-    pub texture: [f32; 3],
-}
-implement_vertex!(MeshVertex, position, normal, texture);
-
-impl Mesh {
-    fn load_obj<F: Facade>(facade: &F, bytes: &[u8]) -> Self {
-        let input = bytes;
-        let obj = obj::load_obj(&input[..]).unwrap();
-
-        let vertices = obj.vertices.iter().map(|v: &obj::TexturedVertex| {
-            MeshVertex {
-                position: v.position,
-                normal: v.normal,
-                texture: v.texture,
-            }
-        }).collect::<Vec<_>>();
-
-        Mesh {
-            vertices: VertexBuffer::immutable(facade, &vertices).unwrap(),
-            indices: IndexBuffer::immutable(facade, PrimitiveType::TrianglesList, &obj.indices).unwrap()
-        }
-    }
-}
-
-
 struct RenderResources {
-    g_buffer: GBuffer,
     camera_uniforms_buffer: UniformBuffer<CameraUniforms>,
+    g_buffer: GBuffer,
     particles: ParticleSystem,
 }
+
+#[allow(non_snake_case)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CameraUniforms {
+    worldToCameraMatrix: [[f32; 4]; 4],
+    cameraToClipMatrix: [[f32; 4]; 4]
+}
+implement_uniform_block!(CameraUniforms, worldToCameraMatrix, cameraToClipMatrix);
 
 #[self_referencing]
 struct GBuffer {
@@ -398,6 +63,8 @@ struct GBuffer {
     #[covariant]
     framebuffer: MultiOutputFrameBuffer<'this>
 }
+
+const MAX_NUM_PARTICLES: usize = 1_000_000;
 
 struct ParticleSystem {
     alive_count: UniformBuffer<AliveCount>,
@@ -413,11 +80,20 @@ struct AliveCount {
 }
 implement_uniform_block!(AliveCount, aliveCount);
 
+type PPos = [f32; 4];
+type PVel = [f32; 4];
 struct Particles {
     pos_buffer: UniformBuffer<[PPos]>,
     vel_buffer: UniformBuffer<[PVel]>,
     radius_buffer: UniformBuffer<[f32]>,
     debug: UniformBuffer<[[f32; 4]]>
+}
+
+
+fn new_particle_buffer<T>(facade: &impl Facade)
+                        -> UniformBuffer<[T]> where [T]: Content {
+    UniformBuffer::empty_unsized(facade,
+        MAX_NUM_PARTICLES * size_of::<T>()).unwrap()
 }
 
 
@@ -492,10 +168,10 @@ fn main() {
 
         let mut mapping = particles.radius_buffer.map();
         for val in mapping.iter_mut() {
-            *val = rand::random::<f32>() * 0.1 + 1.05;
+            *val = rand::random::<f32>() * 0.1 + 0.05;
         }
 
-        //render_resources.particles.alive_count.write(&AliveCount { aliveCount: NUM_PARTICLES as u32 });
+        render_resources.particles.alive_count.write(&AliveCount { aliveCount: MAX_NUM_PARTICLES as u32 / 10 });
         render_resources.particles.alive_count.write(&AliveCount { aliveCount: 0 });
     }
 
@@ -573,7 +249,9 @@ fn render(display: &glium::Display, target: &mut impl Surface,
     }
 
     let scene_shader_program = Program::from_source(display,
-        MESH_VERTEX_SHADER_SRC, MESH_FRAGMENT_SHADER_SRC, None).unwrap();
+        include_shader!("static_mesh.vert"),
+        include_shader!("static_mesh.frag"),
+        None).unwrap();
     render_resources.g_buffer.with_mut(|g_buffer| {
         g_buffer.framebuffer.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
         render_scene(g_buffer.framebuffer, time,
@@ -583,8 +261,9 @@ fn render(display: &glium::Display, target: &mut impl Surface,
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
 
     let program = Program::from_source(display,
-        FULLSCREEN_VERTEX_SHADER_SRC,
-        BLIT_FRAGMENT_SHADER_SRC, None).unwrap();
+        include_shader!("fullscreen_triangle.vert"),
+        include_shader!("blit.frag"),
+        None).unwrap();
     target.draw(
         EmptyVertexAttributes { len: 3 },
         NoIndices(PrimitiveType::TrianglesList),
@@ -613,13 +292,13 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         time, delta_time
     );
 
-    spawn_particles(
+    /* spawn_particles(
         display,
         system,
         &render_resources.camera_uniforms_buffer,
         &render_resources.g_buffer,
         time, delta_time
-    );
+    ); */
 
     // TODO: Avoid reading back particle count to CPU, use indirect draw?
     let alive_count = system.alive_count.read().unwrap().aliveCount as usize;
@@ -642,15 +321,21 @@ fn update_particles(display: &glium::Display,
 
     // TODO: Avoid reading back particle count to CPU, use indirect dispatch?
     let alive_count = system.alive_count.read().unwrap().aliveCount;
+    if alive_count == 0 {
+        return;
+    }
+
     system.alive_count.write(&AliveCount { aliveCount: 0 });
     
-    let program = ComputeShader::from_source(display, UPDATE_PARTICLES_SRC).unwrap();
+    let program = ComputeShader::from_source(display,
+        include_shader!("particles/test_particles_update.comp")).unwrap();
     program.execute(
         uniform! {
             time: time,
             deltaTime: delta_time,
             Camera: &*camera_uniforms_buffer,
 
+            prevAliveCount: alive_count,
             AliveCount: &*system.alive_count,
 
             PrevPositions: &*system.prev.pos_buffer,
@@ -665,8 +350,10 @@ fn update_particles(display: &glium::Display,
             sceneDepth: g_buffer.borrow_depth(),
             sceneNormal: g_buffer.borrow_normal()
         },
-        alive_count, 1, 1
+        (alive_count + 1023) / 1024, 1, 1
     );
+
+    println!("Alive: {}, work groups: {}", alive_count, (alive_count + 1023) / 1024);
 
     /* {
         let mapping = system.current.pos_buffer.map();
@@ -678,13 +365,15 @@ fn update_particles(display: &glium::Display,
 
     println!("After update: {}", system.alive_count.read().unwrap().aliveCount);
 
-    /* {
+    {
         let mapping = system.current.debug.map_read();
-        for val in mapping.iter().take(1) {
+        for val in mapping.iter().take(10) {
             println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
         }
         println!("...");
-    } */
+    }
+
+    //panic!();
 }
 
 fn spawn_particles(display: &glium::Display,
@@ -693,7 +382,8 @@ fn spawn_particles(display: &glium::Display,
                     g_buffer: &GBuffer,
                     time: f32, delta_time: f32) {
     
-    let program = ComputeShader::from_source(display, SPAWN_PARTICLES_SRC).unwrap();
+    let program = ComputeShader::from_source(display,
+        include_shader!("particles/test_particles_spawn.comp")).unwrap();
     program.execute(
         uniform! {
             time: time,
@@ -721,8 +411,10 @@ fn render_particles(display: &glium::Display, target: &mut impl Surface,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
                     time: f32) {
 
-    let program = Program::from_source(display, VERTEX_SHADER_SRC,
-                                            FRAGMENT_SHADER_SRC, None).unwrap();
+    let program = Program::from_source(display,
+        include_shader!("particles/particle_billboard.vert"),
+        include_shader!("particles/particle_billboard.frag"),
+        None).unwrap();
     target.draw(
         (
             EmptyVertexAttributes { len: 4 },

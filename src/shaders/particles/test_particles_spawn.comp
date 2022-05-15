@@ -1,0 +1,9 @@
+#version 430
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+{% include "particles/common/spawn_common.glsl" %}
+
+void main() {
+    emitParticle(vec3(0), vec3(0,3,0), 0.1);
+}

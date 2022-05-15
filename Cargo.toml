@@ -12,3 +12,8 @@ glam = "0.8.5"
 rand = "0.8.5"
 obj-rs = { version = "0.7.0", features = ["glium"] }
 ouroboros = "0.15.0"
+
+[build-dependencies]
+# Shader pre-processing
+tera = { version = "1.15.0", default-features = false }
+walkdir = "2.3.2"
