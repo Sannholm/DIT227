@@ -3,7 +3,7 @@ uniform float deltaTime;
 
 {% include "common/camera.glsl" %}
 
-uint prevAliveCount;
+uniform uint prevAliveCount;
 
 layout(std140) restrict readonly buffer PrevPositions {
     vec4 prevPositions[];

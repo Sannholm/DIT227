@@ -64,12 +64,21 @@ struct GBuffer {
     framebuffer: MultiOutputFrameBuffer<'this>
 }
 
-const MAX_NUM_PARTICLES: usize = 1_000_000;
+const MAX_NUM_PARTICLES: usize = 3_000_000;
 
 struct ParticleSystem {
-    alive_count: UniformBuffer<AliveCount>,
     current: Particles,
     prev: Particles
+}
+
+type PPos = [f32; 4];
+type PVel = [f32; 4];
+struct Particles {
+    alive_count: UniformBuffer<AliveCount>,
+    pos_buffer: UniformBuffer<[PPos]>,
+    vel_buffer: UniformBuffer<[PVel]>,
+    radius_buffer: UniformBuffer<[f32]>,
+    debug: UniformBuffer<[[f32; 4]]>
 }
 
 #[allow(non_snake_case)]
@@ -79,15 +88,6 @@ struct AliveCount {
     aliveCount: u32
 }
 implement_uniform_block!(AliveCount, aliveCount);
-
-type PPos = [f32; 4];
-type PVel = [f32; 4];
-struct Particles {
-    pos_buffer: UniformBuffer<[PPos]>,
-    vel_buffer: UniformBuffer<[PVel]>,
-    radius_buffer: UniformBuffer<[f32]>,
-    debug: UniformBuffer<[[f32; 4]]>
-}
 
 
 fn new_particle_buffer<T>(facade: &impl Facade)
@@ -125,14 +125,15 @@ fn main() {
         }.build(),
 
         particles: ParticleSystem {
-            alive_count: UniformBuffer::new(&display, AliveCount { aliveCount: 0 }).unwrap(),
             current: Particles {
+                alive_count: UniformBuffer::new(&display, AliveCount { aliveCount: 0 }).unwrap(),
                 pos_buffer: new_particle_buffer(&display),
                 vel_buffer: new_particle_buffer(&display),
                 radius_buffer: new_particle_buffer(&display),
                 debug: new_particle_buffer(&display)
             },
             prev: Particles {
+                alive_count: UniformBuffer::new(&display, AliveCount { aliveCount: 0 }).unwrap(),
                 pos_buffer: new_particle_buffer(&display),
                 vel_buffer: new_particle_buffer(&display),
                 radius_buffer: new_particle_buffer(&display),
@@ -159,10 +160,10 @@ fn main() {
         let mut mapping = particles.vel_buffer.map();
         for val in mapping.iter_mut() {
             *val = [
-                10.0,
+                1.0,
                 0.0,
                 0.0,
-                1.0
+                0.0
             ];
         }
 
@@ -171,8 +172,8 @@ fn main() {
             *val = rand::random::<f32>() * 0.1 + 0.05;
         }
 
-        render_resources.particles.alive_count.write(&AliveCount { aliveCount: MAX_NUM_PARTICLES as u32 / 10 });
-        render_resources.particles.alive_count.write(&AliveCount { aliveCount: 0 });
+        particles.alive_count.write(&AliveCount { aliveCount: MAX_NUM_PARTICLES as u32 / 10 });
+        //particles.alive_count.write(&AliveCount { aliveCount: 0 });
     }
 
     let mut camera = Camera {
@@ -292,20 +293,17 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         time, delta_time
     );
 
-    /* spawn_particles(
+    spawn_particles(
         display,
-        system,
+        &mut system.current,
         &render_resources.camera_uniforms_buffer,
         &render_resources.g_buffer,
         time, delta_time
-    ); */
+    );
 
-    // TODO: Avoid reading back particle count to CPU, use indirect draw?
-    let alive_count = system.alive_count.read().unwrap().aliveCount as usize;
     render_particles(
         display, target,
         &render_resources.particles.current,
-        alive_count,
         &render_resources.camera_uniforms_buffer,
         time
     );
@@ -320,13 +318,12 @@ fn update_particles(display: &glium::Display,
     std::mem::swap(&mut system.current, &mut system.prev);
 
     // TODO: Avoid reading back particle count to CPU, use indirect dispatch?
-    let alive_count = system.alive_count.read().unwrap().aliveCount;
-    if alive_count == 0 {
-        return;
-    }
+    let alive_count = system.prev.alive_count.read().unwrap().aliveCount;
+    let num_workgroups = (alive_count + 1023) / 1024;
+    println!("Alive: {}, Workgroups: {}", alive_count, num_workgroups);
 
-    system.alive_count.write(&AliveCount { aliveCount: 0 });
-    
+    system.current.alive_count.write(&AliveCount { aliveCount: 0 });
+
     let program = ComputeShader::from_source(display,
         include_shader!("particles/test_particles_update.comp")).unwrap();
     program.execute(
@@ -334,14 +331,13 @@ fn update_particles(display: &glium::Display,
             time: time,
             deltaTime: delta_time,
             Camera: &*camera_uniforms_buffer,
-
+            
             prevAliveCount: alive_count,
-            AliveCount: &*system.alive_count,
-
             PrevPositions: &*system.prev.pos_buffer,
             PrevVelocities: &*system.prev.vel_buffer,
             PrevRadiuses: &*system.prev.radius_buffer,
-
+            
+            AliveCount: &*system.current.alive_count,
             Positions: &*system.current.pos_buffer,
             Velocities: &*system.current.vel_buffer,
             Radiuses: &*system.current.radius_buffer,
@@ -350,10 +346,8 @@ fn update_particles(display: &glium::Display,
             sceneDepth: g_buffer.borrow_depth(),
             sceneNormal: g_buffer.borrow_normal()
         },
-        (alive_count + 1023) / 1024, 1, 1
+        num_workgroups, 1, 1
     );
-
-    println!("Alive: {}, work groups: {}", alive_count, (alive_count + 1023) / 1024);
 
     /* {
         let mapping = system.current.pos_buffer.map();
@@ -363,11 +357,11 @@ fn update_particles(display: &glium::Display,
         println!("...");
     } */
 
-    println!("After update: {}", system.alive_count.read().unwrap().aliveCount);
+    println!("After update: {}", system.current.alive_count.read().unwrap().aliveCount);
 
     {
         let mapping = system.current.debug.map_read();
-        for val in mapping.iter().take(10) {
+        for val in mapping.iter().take(1) {
             println!("{:?}", glam::vec4(val[0], val[1], val[2], val[3]));
         }
         println!("...");
@@ -377,7 +371,7 @@ fn update_particles(display: &glium::Display,
 }
 
 fn spawn_particles(display: &glium::Display,
-                    system: &mut ParticleSystem,
+                    particles: &mut Particles,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
                     g_buffer: &GBuffer,
                     time: f32, delta_time: f32) {
@@ -390,11 +384,10 @@ fn spawn_particles(display: &glium::Display,
             deltaTime: delta_time,
             Camera: &*camera_uniforms_buffer,
 
-            AliveCount: &*system.alive_count,
-
-            Positions: &*system.current.pos_buffer,
-            Velocities: &*system.current.vel_buffer,
-            Radiuses: &*system.current.radius_buffer,
+            AliveCount: &*particles.alive_count,
+            Positions: &*particles.pos_buffer,
+            Velocities: &*particles.vel_buffer,
+            Radiuses: &*particles.radius_buffer,
 
             sceneDepth: g_buffer.borrow_depth(),
             sceneNormal: g_buffer.borrow_normal()
@@ -402,14 +395,16 @@ fn spawn_particles(display: &glium::Display,
         1, 1, 1
     );
 
-    println!("After spawn: {}", system.alive_count.read().unwrap().aliveCount);
+    println!("After spawn: {}", particles.alive_count.read().unwrap().aliveCount);
 }
 
 fn render_particles(display: &glium::Display, target: &mut impl Surface,
                     particles: &Particles,
-                    alive_count: usize,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
                     time: f32) {
+
+    // TODO: Avoid reading back particle count to CPU, use indirect draw?
+    let alive_count = particles.alive_count.read().unwrap().aliveCount as usize;
 
     let program = Program::from_source(display,
         include_shader!("particles/particle_billboard.vert"),
@@ -425,8 +420,8 @@ fn render_particles(display: &glium::Display, target: &mut impl Surface,
         &uniform! {
             time: time,
             Camera: &*camera_uniforms_buffer,
-            ParticlePositions: &*particles.pos_buffer,
-            ParticleRadiuses: &*particles.radius_buffer
+            Positions: &*particles.pos_buffer,
+            Radiuses: &*particles.radius_buffer
         },
         &DrawParameters {
             depth: Depth {
