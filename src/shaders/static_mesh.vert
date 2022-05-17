@@ -1,9 +1,6 @@
 #version 430
 
-layout(std140) buffer Camera {
-    mat4 worldToCameraMatrix;
-    mat4 cameraToClipMatrix;
-};
+{% include "common/camera.glsl" %}
 
 uniform mat4 modelToWorldMatrix;
 

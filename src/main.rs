@@ -50,9 +50,14 @@ struct RenderResources {
 #[derive(Clone, Copy)]
 struct CameraUniforms {
     worldToCameraMatrix: [[f32; 4]; 4],
-    cameraToClipMatrix: [[f32; 4]; 4]
+    cameraToWorldMatrix: [[f32; 4]; 4],
+    cameraToClipMatrix: [[f32; 4]; 4],
+    clipToCameraMatrix: [[f32; 4]; 4]
 }
-implement_uniform_block!(CameraUniforms, worldToCameraMatrix, cameraToClipMatrix);
+implement_uniform_block!(CameraUniforms,
+    worldToCameraMatrix, cameraToWorldMatrix,
+    cameraToClipMatrix, clipToCameraMatrix
+);
 
 #[self_referencing]
 struct GBuffer {
@@ -67,6 +72,7 @@ struct GBuffer {
 const MAX_NUM_PARTICLES: usize = 3_000_000;
 
 struct ParticleSystem {
+    current_frame_num: u32,
     current: Particles,
     prev: Particles
 }
@@ -125,6 +131,7 @@ fn main() {
         }.build(),
 
         particles: ParticleSystem {
+            current_frame_num: 0,
             current: Particles {
                 alive_count: UniformBuffer::new(&display, AliveCount { aliveCount: 0 }).unwrap(),
                 pos_buffer: new_particle_buffer(&display),
@@ -173,7 +180,7 @@ fn main() {
         }
 
         particles.alive_count.write(&AliveCount { aliveCount: MAX_NUM_PARTICLES as u32 / 10 });
-        //particles.alive_count.write(&AliveCount { aliveCount: 0 });
+        particles.alive_count.write(&AliveCount { aliveCount: 0 });
     }
 
     let mut camera = Camera {
@@ -242,11 +249,16 @@ fn render(display: &glium::Display, target: &mut impl Surface,
             landingpad_mesh: &Mesh) {
 
     {
-        let mut mapping = render_resources.camera_uniforms_buffer.map_write();
-        mapping.write(CameraUniforms {
-            worldToCameraMatrix: (Mat4::from_translation(camera.pos) * Mat4::from_quat(camera.rot)).inverse().to_cols_array_2d(),
-            cameraToClipMatrix: Mat4::perspective_rh_gl(camera.fov, camera.aspect_ratio, camera.z_near, camera.z_far).to_cols_array_2d()
-        });
+        let camera_to_world_matrix = Mat4::from_translation(camera.pos) * Mat4::from_quat(camera.rot);
+        let camera_to_clip_matrix = Mat4::perspective_rh_gl(camera.fov, camera.aspect_ratio, camera.z_near, camera.z_far);
+
+        let value = CameraUniforms {
+            worldToCameraMatrix: camera_to_world_matrix.inverse().to_cols_array_2d(),
+            cameraToWorldMatrix: camera_to_world_matrix.to_cols_array_2d(),
+            cameraToClipMatrix: camera_to_clip_matrix.to_cols_array_2d(),
+            clipToCameraMatrix: camera_to_clip_matrix.inverse().to_cols_array_2d()
+        };
+        render_resources.camera_uniforms_buffer.write(&value);
     }
 
     let scene_shader_program = Program::from_source(display,
@@ -298,7 +310,7 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         &mut system.current,
         &render_resources.camera_uniforms_buffer,
         &render_resources.g_buffer,
-        time, delta_time
+        system.current_frame_num, time, delta_time
     );
 
     render_particles(
@@ -320,7 +332,7 @@ fn update_particles(display: &glium::Display,
     // TODO: Avoid reading back particle count to CPU, use indirect dispatch?
     let alive_count = system.prev.alive_count.read().unwrap().aliveCount;
     let num_workgroups = (alive_count + 1023) / 1024;
-    println!("Alive: {}, Workgroups: {}", alive_count, num_workgroups);
+    println!("Frame: {}, Alive: {}, Workgroups: {}", system.current_frame_num, alive_count, num_workgroups);
 
     system.current.alive_count.write(&AliveCount { aliveCount: 0 });
 
@@ -349,6 +361,8 @@ fn update_particles(display: &glium::Display,
         num_workgroups, 1, 1
     );
 
+    system.current_frame_num += 1;
+
     /* {
         let mapping = system.current.pos_buffer.map();
         for val in mapping.iter().take(1) {
@@ -366,34 +380,36 @@ fn update_particles(display: &glium::Display,
         }
         println!("...");
     }
-
-    //panic!();
 }
 
 fn spawn_particles(display: &glium::Display,
                     particles: &mut Particles,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
                     g_buffer: &GBuffer,
-                    time: f32, delta_time: f32) {
+                    frame_num: u32, time: f32, delta_time: f32) {
     
+    let uniforms = uniform! {
+        frameNum: frame_num,
+        time: time,
+        deltaTime: delta_time,
+        Camera: &*camera_uniforms_buffer,
+
+        AliveCount: &*particles.alive_count,
+        Positions: &*particles.pos_buffer,
+        Velocities: &*particles.vel_buffer,
+        Radiuses: &*particles.radius_buffer,
+
+        sceneDepth: g_buffer.borrow_depth(),
+        sceneNormal: g_buffer.borrow_normal()
+    };
+
     let program = ComputeShader::from_source(display,
         include_shader!("particles/test_particles_spawn.comp")).unwrap();
-    program.execute(
-        uniform! {
-            time: time,
-            deltaTime: delta_time,
-            Camera: &*camera_uniforms_buffer,
+    program.execute(uniforms, 1, 1, 1);
 
-            AliveCount: &*particles.alive_count,
-            Positions: &*particles.pos_buffer,
-            Velocities: &*particles.vel_buffer,
-            Radiuses: &*particles.radius_buffer,
-
-            sceneDepth: g_buffer.borrow_depth(),
-            sceneNormal: g_buffer.borrow_normal()
-        },
-        1, 1, 1
-    );
+    let program = ComputeShader::from_source(display,
+        include_shader!("particles/rain_splash_spawn.comp")).unwrap();
+    program.execute(uniforms, 1, 1, 1);
 
     println!("After spawn: {}", particles.alive_count.read().unwrap().aliveCount);
 }

@@ -40,7 +40,7 @@ CollisionQuery checkCollision(vec3 pos, float radius) {
 
     float geometryNdcDepth = texture(sceneDepth, ndcPos * 0.5 + 0.5).x * 2.0 - 1.0;
     vec4 geometryNdcPos = vec4(ndcPos, geometryNdcDepth, 1.0);
-    vec4 geometryViewPos = inverse(cameraToClipMatrix) * geometryNdcPos;
+    vec4 geometryViewPos = clipToCameraMatrix * geometryNdcPos;
     geometryViewPos /= geometryViewPos.w;
 
     float particleDepth = -viewPos.z;

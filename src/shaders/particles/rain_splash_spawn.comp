@@ -1,9 +1,20 @@
 #version 430
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 10, local_size_y = 1, local_size_z = 1) in;
 
 {% include "particles/common/spawn_common.glsl" %}
 
 void main() {
-    emitParticle(vec3(0), vec3(0,3,0), 0.1);
+    initRng();
+
+    vec2 ndcPos = vec2(rand(), rand()) * 2.0 - 1.0;
+    float geometryNdcDepth = texture(sceneDepth, ndcPos * 0.5 + 0.5).x * 2.0 - 1.0;
+    vec4 geometryNdcPos = vec4(ndcPos, geometryNdcDepth, 1.0);
+    vec4 geometryPos = cameraToWorldMatrix * clipToCameraMatrix * geometryNdcPos;
+    geometryPos /= geometryPos.w;
+
+    vec3 geometryNormal = normalize(texture(sceneNormal, ndcPos * 0.5 + 0.5).xyz);
+
+    vec3 spawnPos = geometryPos.xyz + geometryNormal * 0.1;
+    emitParticle(spawnPos, 5.0 * geometryNormal, 0.1);
 }
