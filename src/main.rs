@@ -10,16 +10,20 @@ use glium::buffer::Content;
 use glium::framebuffer::MultiOutputFrameBuffer;
 use glium::index::{PrimitiveType, NoIndices};
 use glium::program::ComputeShader;
-use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d};
+use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d, RawImage2d};
 use glium::texture::texture2d::Texture2d;
 use glium::vertex::{EmptyVertexAttributes, EmptyInstanceAttributes};
-use glium::{Program, DrawParameters, DepthTest, Depth};
+use glium::{Program, DrawParameters, DepthTest, Depth, VertexBuffer, IndexBuffer};
 use glium::uniforms::{UniformBuffer};
 use glium::{glutin, Surface};
 use glium::glutin::dpi::PhysicalSize;
+use gltf::Gltf;
+use gltf::image::Format;
 use mesh::Mesh;
 use rand;
 use ouroboros::self_referencing;
+
+use crate::mesh::MeshVertex;
 
 #[macro_use]
 extern crate glium;
@@ -30,6 +34,7 @@ macro_rules! include_shader {
     };
 }
 
+#[derive(Copy, Clone)]
 struct Camera {
     pos: Vec3,
     rot: Quat,
@@ -159,6 +164,8 @@ fn main() {
     let cb = glutin::ContextBuilder::new();
     let display = glium::Display::new(wb, cb, &event_loop).unwrap();
     
+    let scene = load_scene(&display);
+
     let (width, height) = display.get_framebuffer_dimensions();
     let mut render_resources = RenderResources {
         camera_uniforms_buffer: UniformBuffer::empty(&display).unwrap(),
@@ -217,17 +224,8 @@ fn main() {
         particles.alive_count.write(&AliveCount { aliveCount: 0 });
     } */
 
-    let mut camera = Camera {
-        pos: vec3(17.4914, 10.7833, -30.697),
-        rot: Quat::from_rotation_ypr(0.73312, 0.0, 0.0),
-        fov: 54.4322 * PI / 180.0,
-        aspect_ratio: 1.0,
-        z_near: 0.01,
-        z_far: 10000.0
-    };
-
-    let landingpad_mesh = Mesh::load_obj(&display, include_bytes!("../scenes/landingpad.obj"));
-    let storm_mesh = Mesh::load_obj(&display, include_bytes!("../scenes/storm/Storm.obj"));
+    //let landingpad_mesh = Mesh::load_obj(&display, include_bytes!("../scenes/landingpad.obj"));
+    //let storm_mesh = Mesh::load_obj(&display, include_bytes!("../scenes/storm/Storm.obj"));
 
     let mut time = Duration::ZERO;
 
@@ -260,6 +258,7 @@ fn main() {
         
         let mut target = display.draw();
 
+        let mut camera = scene.camera;
         camera.aspect_ratio = {
             let (width, height) = target.get_dimensions();
             width as f32 / height as f32
@@ -269,8 +268,7 @@ fn main() {
             time.as_secs_f32(), FRAME_DURATION.as_secs_f32(),
             &camera,
             &mut render_resources,
-            &landingpad_mesh,
-            &storm_mesh);
+            &scene);
 
         target.finish().unwrap();
 
@@ -278,12 +276,97 @@ fn main() {
     });
 }
 
+struct Scene {
+    objects: Vec<SceneObject>,
+    camera: Camera
+}
+
+struct SceneObject {
+    transform: Mat4,
+    mesh: mesh::Mesh
+}
+
+fn load_scene(facade: &impl Facade) -> Scene {
+    let (document, buffers, images) = gltf::import("scenes/storm/Storm.gltf").unwrap();
+
+    let textures: Vec<_> = images.iter().map(|data| {
+        let dims = (data.width, data.height);
+        let image = match data.format {
+            Format::R8G8B8 => RawImage2d::from_raw_rgb(data.pixels.clone(), dims),
+            Format::R8G8B8A8 => RawImage2d::from_raw_rgba(data.pixels.clone(), dims),
+            _ => todo!()
+        };
+        glium::texture::SrgbTexture2d::new(facade, image)
+    }).collect();
+
+    let mut objects = Vec::new();
+    let mut cameras = Vec::new();
+
+    fn traverse(facade: &impl Facade, buffers: &Vec<gltf::buffer::Data>,
+                objects: &mut Vec<SceneObject>, cameras: &mut Vec<Camera>,
+                node: gltf::Node, parent_to_world_matrix: Mat4) {
+        let node_to_parent_matrix = Mat4::from_cols_array_2d(&node.transform().matrix());
+        let node_to_world_matrix = parent_to_world_matrix * node_to_parent_matrix;
+
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|buffer: gltf::Buffer| Some(&buffers[buffer.index()]));
+                
+                let vertices: Vec<MeshVertex> = itertools::izip!(
+                    reader.read_positions().unwrap(),
+                    reader.read_normals().unwrap(),
+                    reader.read_tex_coords(0).unwrap().into_f32()
+                ).map(|(position, normal, texture)| {
+                    mesh::MeshVertex { position, normal, texture: [texture[0], texture[1], 0.0] }
+                }).collect();
+                let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
+
+                let mesh = mesh::Mesh {
+                    vertices: VertexBuffer::immutable(facade, &vertices).unwrap(),
+                    indices: IndexBuffer::immutable(facade, PrimitiveType::TrianglesList, &indices).unwrap()
+                };
+
+                objects.push(SceneObject {
+                    transform: node_to_world_matrix,
+                    mesh
+                });
+            }
+        }
+
+        if let Some(camera) = node.camera() {
+            if let gltf::camera::Projection::Perspective(persp) = camera.projection() {
+                let (_, rot, pos) = node_to_world_matrix.to_scale_rotation_translation();
+                cameras.push(Camera {
+                    pos,
+                    rot,
+                    aspect_ratio: 1.0,
+                    fov: persp.yfov(),
+                    z_near: persp.znear(),
+                    z_far: persp.zfar().unwrap()
+                });
+            }
+        }
+
+        for child in node.children() {
+            traverse(facade, &buffers, objects, cameras, child, node_to_world_matrix);
+        }
+    }
+
+    for root in document.default_scene().unwrap().nodes() {
+        traverse(facade, &buffers, &mut objects, &mut cameras, root, Mat4::identity());
+    }
+
+    Scene {
+        objects,
+        camera: cameras[0]
+    }
+}
+
 fn render(display: &glium::Display, target: &mut impl Surface,
             time: f32, delta_time: f32,
             camera: &Camera,
             render_resources: &mut RenderResources,
-            landingpad_mesh: &Mesh,
-            storm_mesh: &Mesh) {
+            scene: &Scene) {
 
     {
         let camera_to_world_matrix = Mat4::from_translation(camera.pos) * Mat4::from_quat(camera.rot);
@@ -306,8 +389,11 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         g_buffer.framebuffer.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
         //render_landingpad_scene(g_buffer.framebuffer, time,
         //    &render_resources.camera_uniforms_buffer, landingpad_mesh, &scene_shader_program);
-        render_storm_scene(g_buffer.framebuffer, time,
-            &render_resources.camera_uniforms_buffer, storm_mesh, &scene_shader_program);
+        //render_storm_scene(g_buffer.framebuffer, time,
+        //    &render_resources.camera_uniforms_buffer, storm_mesh, &scene_shader_program);
+        render_scene(scene, g_buffer.framebuffer, time,
+                    &render_resources.camera_uniforms_buffer,
+                    &scene_shader_program);
     });
 
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
@@ -480,6 +566,34 @@ fn render_particles(display: &glium::Display, target: &mut impl Surface,
             ..Default::default()
         }
     ).unwrap();
+}
+
+fn render_scene(
+    scene: &Scene,
+    target: &mut impl Surface,
+    time: f32,
+    camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+    scene_shader_program: &Program) {
+    
+    let draw_parameters = DrawParameters {
+        depth: Depth {
+            test: DepthTest::IfLess,
+            write: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    for object in &scene.objects {
+        target.draw(&object.mesh.vertices, &object.mesh.indices,
+            scene_shader_program,
+            &uniform! {
+                Camera: &*camera_uniforms_buffer,
+                modelToWorldMatrix: object.transform.to_cols_array_2d()
+            },
+            &draw_parameters
+        ).unwrap();
+    }
 }
 
 fn render_storm_scene(target: &mut impl Surface,

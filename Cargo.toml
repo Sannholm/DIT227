@@ -11,7 +11,9 @@ glutin = "0.28.0"
 glam = "0.8.5"
 rand = "0.8.5"
 obj-rs = { version = "0.7.0", features = ["glium"] }
+gltf = "1.0.0"
 ouroboros = "0.15.0"
+itertools = "0.10.3"
 
 [build-dependencies]
 # Shader pre-processing
