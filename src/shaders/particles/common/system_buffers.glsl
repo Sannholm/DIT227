@@ -2,6 +2,10 @@ layout(std140) restrict buffer AliveCount {
     uint aliveCount;
 };
 
+layout(std140) restrict buffer Lifetimes {
+    float lifetimes[];
+};
+
 layout(std140) restrict buffer Positions {
     vec4 positions[];
 };

@@ -40,5 +40,5 @@ fn generate_shaders() {
 }
 
 fn main() {
-    generate_shaders()
+    //generate_shaders()
 }

@@ -15,6 +15,10 @@ gltf = "1.0.0"
 ouroboros = "0.15.0"
 itertools = "0.10.3"
 
+# Shader pre-processing
+tera = { version = "1.15.0", default-features = false }
+walkdir = "2.3.2"
+
 [build-dependencies]
 # Shader pre-processing
 tera = { version = "1.15.0", default-features = false }

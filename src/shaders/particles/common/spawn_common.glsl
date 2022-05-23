@@ -20,17 +20,26 @@ void initRng() {
     initRng(rngState, frameNum * numInvocations + invocationIndex);
 }
 
-uint randInt()
-{
+uint randInt() {
 	return randInt(rngState);
 }
 
-uint randIntRange(const uint bound)
-{
+uint randIntRange(const uint bound) {
     return randIntRange(rngState, bound);
 }
 
-float rand()
-{
+float rand() {
 	return rand(rngState);
+}
+
+float randBetween(float p1, float p2) {
+    return mix(p1, p2, rand());
+}
+
+vec2 randBetween(vec2 p1, vec2 p2) {
+    return mix(p1, p2, vec2(rand(), rand()));
+}
+
+vec3 randBetween(vec3 p1, vec3 p2) {
+    return mix(p1, p2, vec3(rand(), rand(), rand()));
 }

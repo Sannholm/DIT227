@@ -7,6 +7,10 @@ uniform float deltaTime;
 
 uniform uint prevAliveCount;
 
+layout(std140) restrict readonly buffer PrevLifetimes {
+    float prevLifetimes[];
+};
+
 layout(std140) restrict readonly buffer PrevPositions {
     vec4 prevPositions[];
 };
@@ -62,17 +66,18 @@ CollisionQuery checkCollision(vec3 pos, float radius) {
 
 {% include "particles/common/emit_function.glsl" %}
 
-void updateParticle(vec3 p0, vec3 v0, float radius);
+void updateParticle(float t0, vec3 p0, vec3 v0, float radius);
 
 void main() {
     // Ignore extra invocations when number of alive particles is not
     // a multiple of work group size
     if (gl_GlobalInvocationID.x >= prevAliveCount)
         return;
-
+    
+    float t0 = prevLifetimes[gl_GlobalInvocationID.x];
     vec3 p0 = prevPositions[gl_GlobalInvocationID.x].xyz;
     vec3 v0 = prevVelocities[gl_GlobalInvocationID.x].xyz;
     float radius = prevRadiuses[gl_GlobalInvocationID.x];
     
-    updateParticle(p0, v0, radius);
+    updateParticle(t0, p0, v0, radius);
 }

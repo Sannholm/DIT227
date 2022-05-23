@@ -1,5 +1,6 @@
 mod mesh;
 
+use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::mem::size_of;
 use std::time::Duration;
@@ -13,12 +14,14 @@ use glium::program::ComputeShader;
 use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d, RawImage2d};
 use glium::texture::texture2d::Texture2d;
 use glium::vertex::{EmptyVertexAttributes, EmptyInstanceAttributes};
-use glium::{Program, DrawParameters, DepthTest, Depth, VertexBuffer, IndexBuffer};
+use glium::{Program, DrawParameters, DepthTest, Depth, VertexBuffer, IndexBuffer, draw_parameters};
 use glium::uniforms::{UniformBuffer};
 use glium::{glutin, Surface};
 use glium::glutin::dpi::PhysicalSize;
 use gltf::Gltf;
 use gltf::image::Format;
+use glutin::event::VirtualKeyCode;
+use itertools::Itertools;
 use mesh::Mesh;
 use rand;
 use ouroboros::self_referencing;
@@ -28,11 +31,74 @@ use crate::mesh::MeshVertex;
 #[macro_use]
 extern crate glium;
 
-macro_rules! include_shader {
-    ($path:literal) => {
-        include_str!(concat!(env!("OUT_DIR"), "/shaders/", $path))
-    };
+struct ShaderLoader {
+    programs: HashMap<String, Program>,
+    compute_programs: HashMap<String, ComputeShader>,
 }
+
+impl ShaderLoader {
+    fn new() -> Self {
+        Self {
+            programs: HashMap::new(),
+            compute_programs: HashMap::new()
+        }
+    }
+
+    fn clear_cache(&mut self) {
+        self.programs.clear();
+        self.compute_programs.clear();
+    }
+
+    fn get(&mut self, facade: &impl Facade, vert_path: &str, frag_path: &str) -> &Program {
+        let key = format!("{}{}", vert_path, frag_path);
+        self.programs.entry(key).or_insert_with(|| {
+            loop {
+                let program = Program::from_source(facade,
+                    ShaderLoader::load_program_source(vert_path).as_str(),
+                    ShaderLoader::load_program_source(frag_path).as_str(),
+                    None);
+                match program {
+                    Ok(program) => return program,
+                    Err(e) => {
+                        println!("Failed to load shader program {} or {}:\n{}", vert_path, frag_path, e)
+                    }
+                }
+            }
+        })
+    }
+
+    fn get_compute(&mut self, facade: &impl Facade, path: &str) -> &ComputeShader {
+        self.compute_programs.entry(path.to_string()).or_insert_with(|| {
+            loop {
+                let src = ShaderLoader::load_program_source(path);
+                let program = ComputeShader::from_source(facade,
+                    src.as_str());
+                match program {
+                    Ok(program) => return program,
+                    Err(e) => {
+                        println!("Failed to load compute program {}:\n{}\n{}", path, e,
+                            ShaderLoader::format_source_for_debug(&src))
+                    }
+                }
+            }
+        })
+    }
+
+    fn load_program_source(path: &str) -> String {
+        const SHADER_SRC_PATH: &str = "src/shaders";
+    
+        let tera = tera::Tera::new(format!("{}/**/*", SHADER_SRC_PATH).as_str()).unwrap();
+        tera.render(path, &tera::Context::new()).unwrap()
+    }
+
+    fn format_source_for_debug(src: &str) -> String {
+        src.lines().zip(std::iter::successors(Some(1), |x| Some(x+1)))
+            .map(|(line, num)| format!("{}: {}", num, line))
+            .join("\n")
+    }
+}
+
+
 
 #[derive(Copy, Clone)]
 struct Camera {
@@ -44,10 +110,11 @@ struct Camera {
     z_far: f32
 }
 
-struct RenderResources {
+struct RenderResources<'a> {
+    shaders: ShaderLoader,
     camera_uniforms_buffer: UniformBuffer<CameraUniforms>,
     g_buffer: GBuffer,
-    particle_systems: Vec<ParticleSystem>,
+    particle_systems: Vec<ParticleSystem<'a>>,
 }
 
 #[allow(non_snake_case)]
@@ -76,18 +143,22 @@ struct GBuffer {
 
 const MAX_NUM_PARTICLES: usize = 3_000_000;
 
-struct ParticleSystem {
+struct ParticleSystem<'a> {
     current_frame_num: u32,
     current: Particles,
     prev: Particles,
-    spawn_programs: Vec<ComputeShader>,
-    update_program: ComputeShader
+    spawn_programs: Vec<&'a str>,
+    update_program: &'a str,
+    vertex_program: &'a str,
+    fragment_program: &'a str,
+    draw_parameters: DrawParameters<'a>
 }
 
 type PPos = [f32; 4];
 type PVel = [f32; 4];
 struct Particles {
     alive_count: UniformBuffer<AliveCount>,
+    lifetime_buffer: UniformBuffer<[f32]>,
     pos_buffer: UniformBuffer<[PPos]>,
     vel_buffer: UniformBuffer<[PVel]>,
     radius_buffer: UniformBuffer<[f32]>,
@@ -104,57 +175,90 @@ implement_uniform_block!(AliveCount, aliveCount);
 
 fn setup_particle_systems(facade: &impl Facade, systems: &mut Vec<ParticleSystem>) {
     let system =
-        |spawn_programs, update_program| create_particle_system(facade, spawn_programs, update_program);
+        |spawns, update, vert, frag, draw_params| {
+            ParticleSystem::new(facade, spawns, update,
+                vert, frag, draw_params)
+        };
+    
+    let draw_params = DrawParameters {
+        depth: Depth {
+            test: DepthTest::IfLess,
+            write: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    
     systems.extend([
-        system(
+        /*system(
             &[
-                include_shader!("particles/test_particles_spawn.comp"),
-                include_shader!("particles/rain_splash_spawn.comp")
+                "particles/test_particles_spawn.comp",
+                "particles/rain_splash_spawn.comp"
             ],
-            include_shader!("particles/test_particles_update.comp")
+            "particles/test_particles_update.comp",
+            "particles/particle_billboard.vert",
+            "particles/particle_billboard.frag",
+            draw_params
         ),
         system(
             &[
-                include_shader!("particles/smoke_spawn.comp")
+                "particles/smoke_spawn.comp"
             ],
-            include_shader!("particles/smoke_update.comp")
+            "particles/smoke_update.comp",
+            "particles/particle_billboard.vert",
+            "particles/particle_billboard.frag",
+            draw_params
+        )*/
+        system(
+            &[
+                "particles/rainfall_spawn.comp"
+            ],
+            "particles/rainfall_update.comp",
+            "particles/particle_billboard.vert",
+            "particles/particle_billboard.frag",
+            draw_params
         )
     ]);
 }
 
-fn create_particle_system(facade: &impl Facade,
-                            spawn_programs: &[&str],
-                            update_program: &str) -> ParticleSystem {
-    
-    let create_program = |&src| ComputeShader::from_source(facade, src).unwrap();
-
-    ParticleSystem {
-        current_frame_num: 0,
-        current: Particles {
-            alive_count: UniformBuffer::new(facade, AliveCount { aliveCount: 0 }).unwrap(),
-            pos_buffer: new_particle_buffer(facade),
-            vel_buffer: new_particle_buffer(facade),
-            radius_buffer: new_particle_buffer(facade),
-            debug: new_particle_buffer(facade)
-        },
-        prev: Particles {
-            alive_count: UniformBuffer::new(facade, AliveCount { aliveCount: 0 }).unwrap(),
-            pos_buffer: new_particle_buffer(facade),
-            vel_buffer: new_particle_buffer(facade),
-            radius_buffer: new_particle_buffer(facade),
-            debug: new_particle_buffer(facade)
-        },
-        spawn_programs: spawn_programs.iter()
-                            .map(create_program)
-                            .collect(),
-        update_program: create_program(&update_program)
+impl<'a> ParticleSystem<'a> {
+    fn new(facade: &impl Facade,
+            spawn_programs: &[&'a str],
+            update_program: &'a str,
+            vertex_program: &'a str,
+            fragment_program: &'a str,
+            draw_parameters: DrawParameters<'a>) -> Self {
+        Self {
+            current_frame_num: 0,
+            current: Particles {
+                alive_count: UniformBuffer::new(facade, AliveCount { aliveCount: 0 }).unwrap(),
+                lifetime_buffer: Self::new_particle_buffer(facade),
+                pos_buffer: Self::new_particle_buffer(facade),
+                vel_buffer: Self::new_particle_buffer(facade),
+                radius_buffer: Self::new_particle_buffer(facade),
+                debug: Self::new_particle_buffer(facade)
+            },
+            prev: Particles {
+                alive_count: UniformBuffer::new(facade, AliveCount { aliveCount: 0 }).unwrap(),
+                lifetime_buffer: Self::new_particle_buffer(facade),
+                pos_buffer: Self::new_particle_buffer(facade),
+                vel_buffer: Self::new_particle_buffer(facade),
+                radius_buffer: Self::new_particle_buffer(facade),
+                debug: Self::new_particle_buffer(facade)
+            },
+            spawn_programs: Vec::from_iter(spawn_programs.iter().copied()),
+            update_program,
+            vertex_program,
+            fragment_program,
+            draw_parameters
+        }
     }
-}
 
-fn new_particle_buffer<T>(facade: &impl Facade)
-                        -> UniformBuffer<[T]> where [T]: Content {
-    UniformBuffer::empty_unsized(facade,
-        MAX_NUM_PARTICLES * size_of::<T>()).unwrap()
+    fn new_particle_buffer<T>(facade: &impl Facade)
+                            -> UniformBuffer<[T]> where [T]: Content {
+        UniformBuffer::empty_unsized(facade,
+            MAX_NUM_PARTICLES * size_of::<T>()).unwrap()
+    }
 }
 
 fn main() {
@@ -168,6 +272,7 @@ fn main() {
 
     let (width, height) = display.get_framebuffer_dimensions();
     let mut render_resources = RenderResources {
+        shaders: ShaderLoader::new(),
         camera_uniforms_buffer: UniformBuffer::empty(&display).unwrap(),
         g_buffer: GBufferBuilder {
             color: Texture2d::empty_with_format(&display, UncompressedFloatFormat::F32F32F32F32,
@@ -236,6 +341,14 @@ fn main() {
                 glutin::event::WindowEvent::CloseRequested => {
                     *control_flow = glutin::event_loop::ControlFlow::Exit;
                     return;
+                },
+                glutin::event::WindowEvent::KeyboardInput { device_id: _, input, is_synthetic: _ } => {
+                    if input.state == glutin::event::ElementState::Released {
+                        if let Some(VirtualKeyCode::R) = input.virtual_keycode {
+                            render_resources.shaders.clear_cache()
+                        }
+                    }
+                    return
                 },
                 _ => return,
             },
@@ -381,10 +494,9 @@ fn render(display: &glium::Display, target: &mut impl Surface,
         render_resources.camera_uniforms_buffer.write(&value);
     }
 
-    let scene_shader_program = Program::from_source(display,
-        include_shader!("static_mesh.vert"),
-        include_shader!("static_mesh.frag"),
-        None).unwrap();
+    let scene_shader_program = render_resources.shaders.get(display,
+        "static_mesh.vert",
+        "static_mesh.frag");
     render_resources.g_buffer.with_mut(|g_buffer| {
         g_buffer.framebuffer.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
         //render_landingpad_scene(g_buffer.framebuffer, time,
@@ -398,10 +510,9 @@ fn render(display: &glium::Display, target: &mut impl Surface,
 
     target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
 
-    let program = Program::from_source(display,
-        include_shader!("fullscreen_triangle.vert"),
-        include_shader!("blit.frag"),
-        None).unwrap();
+    let program = render_resources.shaders.get(display,
+        "fullscreen_triangle.vert",
+        "blit.frag");
     target.draw(
         EmptyVertexAttributes { len: 3 },
         NoIndices(PrimitiveType::TrianglesList),
@@ -421,8 +532,10 @@ fn render(display: &glium::Display, target: &mut impl Surface,
     ).unwrap();
 
     for system in &mut render_resources.particle_systems {
+        let program = render_resources.shaders.get_compute(display, system.update_program);
         update_particles(
             system,
+            &program,
             &render_resources.camera_uniforms_buffer,
             &render_resources.g_buffer,
             time, delta_time
@@ -430,7 +543,8 @@ fn render(display: &glium::Display, target: &mut impl Surface,
     }
     
     for system in &mut render_resources.particle_systems {
-        for program in &system.spawn_programs {
+        for program_path in &system.spawn_programs {
+            let program = render_resources.shaders.get_compute(display, program_path);
             spawn_particles(
                 &program,
                 &mut system.current,
@@ -440,18 +554,24 @@ fn render(display: &glium::Display, target: &mut impl Surface,
             );
         }
     }
-
+    
     for system in &render_resources.particle_systems {
+        let program = render_resources.shaders.get(display,
+            &system.vertex_program,
+            &system.fragment_program);
         render_particles(
-            display, target,
+            target,
             &system.current,
             &render_resources.camera_uniforms_buffer,
+            &program,
+            &system.draw_parameters,
             time
         );
     }
 }
 
 fn update_particles(system: &mut ParticleSystem,
+                    program: &ComputeShader,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
                     g_buffer: &GBuffer,
                     time: f32, delta_time: f32) {
@@ -469,11 +589,13 @@ fn update_particles(system: &mut ParticleSystem,
         Camera: &*camera_uniforms_buffer,
         
         prevAliveCount: alive_count,
+        PrevLifetimes: &*system.prev.lifetime_buffer,
         PrevPositions: &*system.prev.pos_buffer,
         PrevVelocities: &*system.prev.vel_buffer,
         PrevRadiuses: &*system.prev.radius_buffer,
         
         AliveCount: &*system.current.alive_count,
+        Lifetimes: &*system.current.lifetime_buffer,
         Positions: &*system.current.pos_buffer,
         Velocities: &*system.current.vel_buffer,
         Radiuses: &*system.current.radius_buffer,
@@ -484,7 +606,7 @@ fn update_particles(system: &mut ParticleSystem,
     };
 
     system.current.alive_count.write(&AliveCount { aliveCount: 0 });
-    system.update_program.execute(uniforms, num_workgroups, 1, 1);
+    program.execute(uniforms, num_workgroups, 1, 1);
     system.current_frame_num += 1;
 
     /* {
@@ -519,6 +641,7 @@ fn spawn_particles(program: &ComputeShader,
         Camera: &*camera_uniforms_buffer,
 
         AliveCount: &*particles.alive_count,
+        Lifetimes: &*particles.lifetime_buffer,
         Positions: &*particles.pos_buffer,
         Velocities: &*particles.vel_buffer,
         Radiuses: &*particles.radius_buffer,
@@ -532,39 +655,33 @@ fn spawn_particles(program: &ComputeShader,
     println!("After spawn: {}", particles.alive_count.read().unwrap().aliveCount);
 }
 
-fn render_particles(display: &glium::Display, target: &mut impl Surface,
+fn render_particles(target: &mut impl Surface,
                     particles: &Particles,
                     camera_uniforms_buffer: &UniformBuffer<CameraUniforms>,
+                    program: &Program,
+                    draw_params: &DrawParameters,
                     time: f32) {
 
     // TODO: Avoid reading back particle count to CPU, use indirect draw?
     let alive_count = particles.alive_count.read().unwrap().aliveCount as usize;
 
-    let program = Program::from_source(display,
-        include_shader!("particles/particle_billboard.vert"),
-        include_shader!("particles/particle_billboard.frag"),
-        None).unwrap();
     target.draw(
         (
             EmptyVertexAttributes { len: 4 },
             EmptyInstanceAttributes { len: alive_count }
         ),
         NoIndices(PrimitiveType::TriangleStrip),
-        &program,
+        program,
         &uniform! {
             time: time,
             Camera: &*camera_uniforms_buffer,
+
+            Lifetimes: &*particles.lifetime_buffer,
             Positions: &*particles.pos_buffer,
-            Radiuses: &*particles.radius_buffer
+            Velocities: &*particles.vel_buffer,
+            Radiuses: &*particles.radius_buffer,
         },
-        &DrawParameters {
-            depth: Depth {
-                test: DepthTest::IfLess,
-                write: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        draw_params
     ).unwrap();
 }
 

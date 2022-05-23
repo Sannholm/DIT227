@@ -15,6 +15,6 @@ void main() {
 
     vec3 geometryNormal = normalize(texture(sceneNormal, ndcPos * 0.5 + 0.5).xyz);
 
-    vec3 spawnPos = geometryPos.xyz + geometryNormal * 0.1;
-    emitParticle(spawnPos, 5.0 * geometryNormal, 0.1);
+    vec3 spawnPos = geometryPos.xyz + geometryNormal * 0.01;
+    emitParticle(spawnPos, 5.0 * geometryNormal, 0.01);
 }
