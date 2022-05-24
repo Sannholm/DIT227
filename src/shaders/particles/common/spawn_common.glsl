@@ -1,4 +1,5 @@
 uniform uint frameNum;
+uniform float time;
 
 {% include "common/camera.glsl" %}
 

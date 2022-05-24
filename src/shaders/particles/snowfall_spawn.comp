@@ -1,21 +1,24 @@
 #version 430
 
-layout(local_size_x = 1000, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 500, local_size_y = 1, local_size_z = 1) in;
 
 {% include "particles/common/spawn_common.glsl" %}
 
 void main() {
     initRng();
 
-    const vec2 sceneCorner1 = vec2(-30, -37);
+    const vec2 sceneCorner1 = vec2(-40, -37);
     const vec2 sceneCorner2 = vec2(30, -90);
 
-    float height = 30 + rand() * 9;
+    float height = 20 + rand() * 9;
     vec2 pos = randBetween(sceneCorner1, sceneCorner2);
+    //pos = (sceneCorner1 + sceneCorner2) / 2;
     vec3 spawnPos = vec3(pos.x, height, pos.y);
 
     vec3 dir = normalize(vec3(0, -1, 0));
     const float speed = 0; // m/s
 
-    emitParticle(spawnPos, dir * speed, 0.05);
+    float radius = randBetween(0.025, 0.04);
+
+    emitParticle(spawnPos, dir * speed, radius);
 }

@@ -14,7 +14,7 @@ use glium::program::ComputeShader;
 use glium::texture::{UncompressedFloatFormat, MipmapsOption, DepthFormat, DepthTexture2d, RawImage2d};
 use glium::texture::texture2d::Texture2d;
 use glium::vertex::{EmptyVertexAttributes, EmptyInstanceAttributes};
-use glium::{Program, DrawParameters, DepthTest, Depth, VertexBuffer, IndexBuffer, draw_parameters};
+use glium::{Program, DrawParameters, DepthTest, Depth, VertexBuffer, IndexBuffer, draw_parameters, Blend};
 use glium::uniforms::{UniformBuffer};
 use glium::{glutin, Surface};
 use glium::glutin::dpi::PhysicalSize;
@@ -211,12 +211,20 @@ fn setup_particle_systems(facade: &impl Facade, systems: &mut Vec<ParticleSystem
         )*/
         system(
             &[
-                "particles/rainfall_spawn.comp"
+                "particles/snowfall_spawn.comp"
             ],
-            "particles/rainfall_update.comp",
+            "particles/snowfall_update.comp",
             "particles/particle_billboard.vert",
-            "particles/particle_billboard.frag",
-            draw_params
+            "particles/snowfall.frag",
+            DrawParameters {
+                depth: Depth {
+                    test: DepthTest::IfLess,
+                    write: false,
+                    ..Default::default()
+                },
+                blend: Blend::alpha_blending(),
+                ..Default::default()
+            }
         )
     ]);
 }
@@ -265,7 +273,8 @@ fn main() {
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new()
         .with_inner_size(PhysicalSize::new(1280u32, 720u32));
-    let cb = glutin::ContextBuilder::new();
+    let cb = glutin::ContextBuilder::new()
+        .with_multisampling(8);
     let display = glium::Display::new(wb, cb, &event_loop).unwrap();
     
     let scene = load_scene(&display);
@@ -584,6 +593,7 @@ fn update_particles(system: &mut ParticleSystem,
     println!("Frame: {}, Alive: {}, Workgroups: {}", system.current_frame_num, alive_count, num_workgroups);
     
     let uniforms = uniform! {
+        frameNum: system.current_frame_num,
         time: time,
         deltaTime: delta_time,
         Camera: &*camera_uniforms_buffer,
@@ -637,7 +647,6 @@ fn spawn_particles(program: &ComputeShader,
     let uniforms = uniform! {
         frameNum: frame_num,
         time: time,
-        deltaTime: delta_time,
         Camera: &*camera_uniforms_buffer,
 
         AliveCount: &*particles.alive_count,

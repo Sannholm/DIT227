@@ -1,5 +1,6 @@
 layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
 
+uniform uint frameNum;
 uniform float time;
 uniform float deltaTime;
 
@@ -80,4 +81,39 @@ void main() {
     float radius = prevRadiuses[gl_GlobalInvocationID.x];
     
     updateParticle(t0, p0, v0, radius);
+}
+
+{% include "common/random.glsl" %}
+
+RngState rngState;
+
+void initRng() {
+    // One unique random stream per frame and per alive particle
+    // Note: Potential overlap of streams between frames since alive count changes
+    uint particleId = gl_GlobalInvocationID.x;
+    initRng(rngState, frameNum * prevAliveCount + particleId);
+}
+
+uint randInt() {
+	return randInt(rngState);
+}
+
+uint randIntRange(const uint bound) {
+    return randIntRange(rngState, bound);
+}
+
+float rand() {
+	return rand(rngState);
+}
+
+float randBetween(float p1, float p2) {
+    return mix(p1, p2, rand());
+}
+
+vec2 randBetween(vec2 p1, vec2 p2) {
+    return mix(p1, p2, vec2(rand(), rand()));
+}
+
+vec3 randBetween(vec3 p1, vec3 p2) {
+    return mix(p1, p2, vec3(rand(), rand(), rand()));
 }

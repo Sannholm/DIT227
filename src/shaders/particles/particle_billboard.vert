@@ -10,6 +10,7 @@ const vec2 OFFSETS[] = vec2[4](
     vec2(0.5,  -0.5)
 );
 
+out flat uint particleId;
 out vec2 uv;
 
 void main() {
@@ -28,6 +29,7 @@ void main() {
     vec2 offset = OFFSETS[gl_VertexID];
     vec3 vertexPos = particlePos + billboardMatrix * vec3(offset * particleRadius, 0);
 
+    particleId = gl_InstanceID;
     uv = offset + vec2(0.5);
     gl_Position = cameraToClipMatrix * worldToCameraMatrix * vec4(vertexPos, 1);
 }
