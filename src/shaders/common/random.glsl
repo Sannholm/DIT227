@@ -4,8 +4,8 @@
 // - https://www.pcg-random.org/
 // - https://github.com/imneme/pcg-c/blob/83252d9c23df9c82ecb42210afed61a7b42402d7/include/pcg_variants.h#L1533
 
-#define PCG_DEFAULT_MULTIPLIER_32 747796405
-#define PCG_DEFAULT_INCREMENT_32  2891336453
+#define PCG_DEFAULT_MULTIPLIER_32 747796405u
+#define PCG_DEFAULT_INCREMENT_32 2891336453u
 
 void pcg_oneseq_32_step_r(inout uint state) {
     state = state * PCG_DEFAULT_MULTIPLIER_32

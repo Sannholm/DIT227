@@ -18,7 +18,7 @@ void main() {
     vec3 particlePos = positions[gl_InstanceID].xyz;
     float particleRadius = radiuses[gl_InstanceID];
 
-    vec3 normal = normalize(cameraPos - particlePos); // Viewpoint-facing
+    vec3 normal = normalize(cameraPos() - particlePos); // Viewpoint-facing
     //normal = normalize(mat3(cameraToWorldMatrix) * vec3(0, 0, 1)); // Viewplane-facing
     
     // TODO: Properly handle case when up and normal are close

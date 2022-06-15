@@ -51,7 +51,7 @@ void main() {
         vec3(-2.00865, 5.94997, -67.7607),
         vec3(-5.58865, 5.94997, -67.7607)
     );
-    for (int i = 0; i < lights.length; i++) {
+    for (int i = 0; i < lights.length(); i++) {
         vec3 color = vec3(255,147,41) / 255 * 5;
         vec3 lightPos = lights[i];
         totalIncomingLight += pointLight(color, lightPos);

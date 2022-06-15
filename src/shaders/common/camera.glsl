@@ -5,4 +5,6 @@ layout(std140) restrict readonly buffer Camera {
     mat4 clipToCameraMatrix;
 };
 
-const vec3 cameraPos = cameraToWorldMatrix[3].xyz;
+vec3 cameraPos() {
+    return cameraToWorldMatrix[3].xyz;
+}
